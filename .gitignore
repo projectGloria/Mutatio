@@ -1,0 +1,21 @@
+# Rust build artifacts
+/target
+Cargo.lock
+
+# Windows temporary / dump files
+*.pdb
+*.exe
+*.dll.bak
+*.log
+*.tmp
+
+# Editor / IDE configuration
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local user configs
+mutatio.json
+out.txt
+err.txt
