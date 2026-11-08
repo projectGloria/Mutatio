@@ -1,6 +1,10 @@
+// GDI draw helpers take raw geometry + style args; bundling them into structs buys nothing here.
+#![allow(clippy::too_many_arguments)]
+
 use crate::config::{Color, TaskbarState};
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
-use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -15,15 +19,19 @@ use windows::Win32::Graphics::Gdi::{
     MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID,
     SRCCOPY, TRANSPARENT,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetClientRect, IsWindowVisible, PostMessageW, RegisterClassW,
     SetForegroundWindow, SetWindowPos, ShowWindow, HWND_TOPMOST, SWP_NOACTIVATE, SW_HIDE, SW_SHOW,
     WA_INACTIVE, WM_ACTIVATE, WM_DESTROY, WM_ERASEBKGND, WM_KILLFOCUS, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_USER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_USER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_POPUP,
 };
 
 pub const WM_FLYOUT_ACTION: u32 = WM_USER + 200;
+
+// Lives in Win32_UI_Controls in windows-rs; not worth a whole feature for one constant.
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
 pub const ACTION_SET_CLEAR: usize = 1;
 pub const ACTION_SET_BLUR: usize = 2;
@@ -51,6 +59,8 @@ pub struct FlyoutState {
     pub game_pause_enabled: bool,
     pub show_border: bool,
     pub current_color: Color,
+    /// Name of the active rendering backend, shown in the header.
+    pub engine: &'static str,
 }
 
 impl Default for FlyoutState {
@@ -63,13 +73,68 @@ impl Default for FlyoutState {
             game_pause_enabled: true,
             show_border: false,
             current_color: Color::transparent(),
+            engine: "",
         }
     }
 }
 
-static FLYOUT_DATA: Mutex<Option<FlyoutState>> = Mutex::new(None);
+// Everything below is only touched from the UI thread (window procs run on the thread that
+// created the window), so thread_local + Cell/RefCell replaces the old global Mutex.
+thread_local! {
+    static FLYOUT_DATA: RefCell<FlyoutState> = RefCell::new(FlyoutState::default());
+    static FONTS: Fonts = Fonts::new();
+    /// When the flyout last auto-hid on deactivation; see `FlyoutWindow::toggle`.
+    static LAST_AUTO_HIDE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
 static PARENT_NOTIFY_HWND: AtomicIsize = AtomicIsize::new(0);
 static HOVER_INDEX: AtomicI32 = AtomicI32::new(-1);
+
+/// GDI fonts created once. The old renderer created and destroyed four fonts on every
+/// WM_PAINT — and every mouse move over the flyout triggers a repaint.
+struct Fonts {
+    title: HFONT,
+    section: HFONT,
+    body: HFONT,
+    sub: HFONT,
+}
+
+impl Fonts {
+    fn new() -> Self {
+        let make = |height: i32, weight: i32, face: windows::core::PCWSTR| unsafe {
+            CreateFontW(
+                height, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, face,
+            )
+        };
+        Self {
+            title: make(20, FW_BOLD.0 as i32, w!("Segoe UI Variable Display")),
+            section: make(12, FW_BOLD.0 as i32, w!("Segoe UI")),
+            body: make(14, FW_SEMIBOLD.0 as i32, w!("Segoe UI Variable Text")),
+            sub: make(11, FW_NORMAL.0 as i32, w!("Segoe UI")),
+        }
+    }
+}
+
+impl Drop for Fonts {
+    fn drop(&mut self) {
+        unsafe {
+            for f in [self.title, self.section, self.body, self.sub] {
+                let _ = DeleteObject(f.into());
+            }
+        }
+    }
+}
+
+/// Quick-tint swatches: (zone, color). Shared by click handling and painting so they can't
+/// disagree.
+const SWATCHES: [(i32, Color); 6] = [
+    (ZONE_SWATCH_BLACK, Color::new(0, 0, 0, 255)),
+    (ZONE_SWATCH_SLATE, Color::new(24, 24, 28, 255)),
+    (ZONE_SWATCH_NAVY, Color::new(14, 30, 56, 255)),
+    (ZONE_SWATCH_CRIMSON, Color::new(50, 12, 18, 255)),
+    (ZONE_SWATCH_EMERALD, Color::new(10, 42, 26, 255)),
+    (ZONE_SWATCH_WHITE, Color::new(255, 255, 255, 255)),
+];
 
 pub struct FlyoutWindow {
     hwnd: HWND,
@@ -79,9 +144,6 @@ impl FlyoutWindow {
     pub fn create(parent_notify_hwnd: HWND) -> Self {
         unsafe {
             PARENT_NOTIFY_HWND.store(parent_notify_hwnd.0 as isize, Ordering::Relaxed);
-            if let Ok(mut lock) = FLYOUT_DATA.lock() {
-                *lock = Some(FlyoutState::default());
-            }
 
             let class_name = w!("MutatioFlyoutWindowClass");
             let wnd_class = WNDCLASSW {
@@ -133,18 +195,26 @@ impl FlyoutWindow {
     }
 
     pub fn update_state(&self, state: FlyoutState) {
-        if let Ok(mut lock) = FLYOUT_DATA.lock() {
-            *lock = Some(state);
-        }
-        unsafe {
-            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        FLYOUT_DATA.with(|d| *d.borrow_mut() = state);
+        // No point repainting a hidden window; show_at() invalidates anyway.
+        if self.is_visible() {
+            unsafe {
+                let _ = InvalidateRect(Some(self.hwnd), None, false);
+            }
         }
     }
 
     pub fn toggle(&self, cursor_pt: POINT) {
+        // Clicking the tray icon while the flyout is open deactivates the flyout on mouse-DOWN
+        // (auto-hide), then the tray's mouse-UP arrives here and would immediately reopen it.
+        // Treat a toggle right after an auto-hide as the "close" click it was meant to be.
+        let just_auto_hidden = LAST_AUTO_HIDE
+            .with(|t| t.take())
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(300));
+
         if self.is_visible() {
             self.hide();
-        } else {
+        } else if !just_auto_hidden {
             self.show_at(cursor_pt);
         }
     }
@@ -211,82 +281,38 @@ const ZONE_TOGGLE_GAME: i32 = 22;
 const ZONE_TOGGLE_BORDER: i32 = 23;
 
 const ZONE_BTN_CONFIG: i32 = 30;
-const ZONE_BTN_RELOAD: i32 = 31;
+const ZONE_BTN_RESTART_SHELL: i32 = 31;
 const ZONE_BTN_EXIT: i32 = 32;
 
+/// Clickable regions as (zone, left, top, right, bottom), inclusive. Must match the geometry
+/// drawn in `render_flyout`.
+const HIT_ZONES: &[(i32, i32, i32, i32, i32)] = &[
+    (ZONE_CLOSE, 310, 10, 340, 40),
+    (ZONE_PRESET_CLEAR, 16, 65, 116, 110),
+    (ZONE_PRESET_BLUR, 125, 65, 225, 110),
+    (ZONE_PRESET_ACRYLIC, 234, 65, 334, 110),
+    (ZONE_PRESET_OPAQUE, 16, 118, 170, 158),
+    (ZONE_PRESET_DEFAULT, 180, 118, 334, 158),
+    (ZONE_SWATCH_BLACK, 20, 195, 50, 225),
+    (ZONE_SWATCH_SLATE, 65, 195, 95, 225),
+    (ZONE_SWATCH_NAVY, 110, 195, 140, 225),
+    (ZONE_SWATCH_CRIMSON, 155, 195, 185, 225),
+    (ZONE_SWATCH_EMERALD, 200, 195, 230, 225),
+    (ZONE_SWATCH_WHITE, 245, 195, 275, 225),
+    (ZONE_TOGGLE_DYNAMIC, 16, 258, 334, 292),
+    (ZONE_TOGGLE_SMOOTH, 16, 296, 334, 330),
+    (ZONE_TOGGLE_GAME, 16, 334, 334, 368),
+    (ZONE_TOGGLE_BORDER, 16, 372, 334, 406),
+    (ZONE_BTN_CONFIG, 16, 464, 114, 500),
+    (ZONE_BTN_RESTART_SHELL, 120, 464, 228, 500),
+    (ZONE_BTN_EXIT, 234, 464, 334, 500),
+];
+
 fn hit_test(x: i32, y: i32) -> i32 {
-    if x >= 310 && x <= 340 && y >= 10 && y <= 40 {
-        return ZONE_CLOSE;
-    }
-
-    if y >= 65 && y <= 110 {
-        if x >= 16 && x <= 116 {
-            return ZONE_PRESET_CLEAR;
-        }
-        if x >= 125 && x <= 225 {
-            return ZONE_PRESET_BLUR;
-        }
-        if x >= 234 && x <= 334 {
-            return ZONE_PRESET_ACRYLIC;
-        }
-    }
-
-    if y >= 118 && y <= 158 {
-        if x >= 16 && x <= 170 {
-            return ZONE_PRESET_OPAQUE;
-        }
-        if x >= 180 && x <= 334 {
-            return ZONE_PRESET_DEFAULT;
-        }
-    }
-
-    if y >= 195 && y <= 225 {
-        if x >= 20 && x <= 50 {
-            return ZONE_SWATCH_BLACK;
-        }
-        if x >= 65 && x <= 95 {
-            return ZONE_SWATCH_SLATE;
-        }
-        if x >= 110 && x <= 140 {
-            return ZONE_SWATCH_NAVY;
-        }
-        if x >= 155 && x <= 185 {
-            return ZONE_SWATCH_CRIMSON;
-        }
-        if x >= 200 && x <= 230 {
-            return ZONE_SWATCH_EMERALD;
-        }
-        if x >= 245 && x <= 275 {
-            return ZONE_SWATCH_WHITE;
-        }
-    }
-
-    if y >= 258 && y <= 292 && x >= 16 && x <= 334 {
-        return ZONE_TOGGLE_DYNAMIC;
-    }
-    if y >= 296 && y <= 330 && x >= 16 && x <= 334 {
-        return ZONE_TOGGLE_SMOOTH;
-    }
-    if y >= 334 && y <= 368 && x >= 16 && x <= 334 {
-        return ZONE_TOGGLE_GAME;
-    }
-    if y >= 372 && y <= 406 && x >= 16 && x <= 334 {
-        return ZONE_TOGGLE_BORDER;
-    }
-
-    if y >= 464 && y <= 500 {
-        if x >= 16 && x <= 114 {
-            return ZONE_BTN_CONFIG;
-        }
-        if x >= 120 && x <= 228 {
-            return ZONE_BTN_RELOAD;
-        }
-        if x >= 234 && x <= 334 {
-            return ZONE_BTN_EXIT;
-        }
-    }
-
-    -1
+    HIT_ZONES
+        .iter()
+        .find(|&&(_, l, t, r, b)| (l..=r).contains(&x) && (t..=b).contains(&y))
+        .map_or(-1, |&(zone, ..)| zone)
 }
 
 unsafe extern "system" fn flyout_wnd_proc(
@@ -325,12 +351,23 @@ unsafe extern "system" fn flyout_wnd_proc(
             WM_ACTIVATE => {
                 let active = (wparam.0 & 0xFFFF) as u16;
                 if active == WA_INACTIVE as u16 {
-                    let _ = ShowWindow(hwnd, SW_HIDE);
+                    auto_hide(hwnd);
                 }
                 LRESULT(0)
             }
             WM_KILLFOCUS => {
+                auto_hide(hwnd);
+                LRESULT(0)
+            }
+            WM_KEYDOWN if wparam.0 == VK_ESCAPE.0 as usize => {
                 let _ = ShowWindow(hwnd, SW_HIDE);
+                LRESULT(0)
+            }
+            WM_MOUSELEAVE => {
+                // Without TrackMouseEvent the last hovered item stayed highlighted forever.
+                if HOVER_INDEX.swap(-1, Ordering::Relaxed) != -1 {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
                 LRESULT(0)
             }
             WM_LBUTTONDOWN => LRESULT(0),
@@ -339,75 +376,15 @@ unsafe extern "system" fn flyout_wnd_proc(
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
                 let zone = hit_test(x, y);
 
+                if zone == ZONE_CLOSE {
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                    return LRESULT(0);
+                }
+
                 let parent_raw = PARENT_NOTIFY_HWND.load(Ordering::Relaxed);
-                if parent_raw != 0 {
+                if let (Some((action, payload)), true) = (zone_action(zone), parent_raw != 0) {
                     let parent = HWND(parent_raw as *mut _);
-                    match zone {
-                        ZONE_CLOSE => {
-                            let _ = ShowWindow(hwnd, SW_HIDE);
-                        }
-                        ZONE_PRESET_CLEAR => {
-                            let _ = PostMessageW(Some(parent), WM_FLYOUT_ACTION, WPARAM(ACTION_SET_CLEAR), LPARAM(0));
-                        }
-                        ZONE_PRESET_BLUR => {
-                            let _ = PostMessageW(Some(parent), WM_FLYOUT_ACTION, WPARAM(ACTION_SET_BLUR), LPARAM(0));
-                        }
-                        ZONE_PRESET_ACRYLIC => {
-                            let _ = PostMessageW(Some(parent), WM_FLYOUT_ACTION, WPARAM(ACTION_SET_ACRYLIC), LPARAM(0));
-                        }
-                        ZONE_PRESET_OPAQUE => {
-                            let _ = PostMessageW(Some(parent), WM_FLYOUT_ACTION, WPARAM(ACTION_SET_OPAQUE), LPARAM(0));
-                        }
-                        ZONE_PRESET_DEFAULT => {
-                            let _ = PostMessageW(Some(parent), WM_FLYOUT_ACTION, WPARAM(ACTION_SET_DEFAULT), LPARAM(0));
-                        }
-                        ZONE_SWATCH_BLACK => {
-                            let col = Color::new(0, 0, 0, 255).to_abgr() as isize;
-                            let _ = PostMessageW(Some(parent), WM_FLYOUT_ACTION, WPARAM(ACTION_SET_COLOR), LPARAM(col));
-                        }
-                        ZONE_SWATCH_SLATE => {
-                            let col = Color::new(24, 24, 28, 255).to_abgr() as isize;
-                            let _ = PostMessageW(Some(parent), WM_FLYOUT_ACTION, WPARAM(ACTION_SET_COLOR), LPARAM(col));
-                        }
-                        ZONE_SWATCH_NAVY => {
-                            let col = Color::new(14, 30, 56, 255).to_abgr() as isize;
-                            let _ = PostMessageW(Some(parent), WM_FLYOUT_ACTION, WPARAM(ACTION_SET_COLOR), LPARAM(col));
-                        }
-                        ZONE_SWATCH_CRIMSON => {
-                            let col = Color::new(50, 12, 18, 255).to_abgr() as isize;
-                            let _ = PostMessageW(Some(parent), WM_FLYOUT_ACTION, WPARAM(ACTION_SET_COLOR), LPARAM(col));
-                        }
-                        ZONE_SWATCH_EMERALD => {
-                            let col = Color::new(10, 42, 26, 255).to_abgr() as isize;
-                            let _ = PostMessageW(Some(parent), WM_FLYOUT_ACTION, WPARAM(ACTION_SET_COLOR), LPARAM(col));
-                        }
-                        ZONE_SWATCH_WHITE => {
-                            let col = Color::new(255, 255, 255, 255).to_abgr() as isize;
-                            let _ = PostMessageW(Some(parent), WM_FLYOUT_ACTION, WPARAM(ACTION_SET_COLOR), LPARAM(col));
-                        }
-                        ZONE_TOGGLE_DYNAMIC => {
-                            let _ = PostMessageW(Some(parent), WM_FLYOUT_ACTION, WPARAM(ACTION_TOGGLE_DYNAMIC), LPARAM(0));
-                        }
-                        ZONE_TOGGLE_SMOOTH => {
-                            let _ = PostMessageW(Some(parent), WM_FLYOUT_ACTION, WPARAM(ACTION_TOGGLE_SMOOTH), LPARAM(0));
-                        }
-                        ZONE_TOGGLE_GAME => {
-                            let _ = PostMessageW(Some(parent), WM_FLYOUT_ACTION, WPARAM(ACTION_TOGGLE_GAME_MODE), LPARAM(0));
-                        }
-                        ZONE_TOGGLE_BORDER => {
-                            let _ = PostMessageW(Some(parent), WM_FLYOUT_ACTION, WPARAM(ACTION_TOGGLE_BORDER), LPARAM(0));
-                        }
-                        ZONE_BTN_CONFIG => {
-                            let _ = PostMessageW(Some(parent), WM_FLYOUT_ACTION, WPARAM(ACTION_OPEN_CONFIG), LPARAM(0));
-                        }
-                        ZONE_BTN_RELOAD => {
-                            let _ = PostMessageW(Some(parent), WM_FLYOUT_ACTION, WPARAM(ACTION_RESTART_EXPLORER), LPARAM(0));
-                        }
-                        ZONE_BTN_EXIT => {
-                            let _ = PostMessageW(Some(parent), WM_FLYOUT_ACTION, WPARAM(ACTION_EXIT), LPARAM(0));
-                        }
-                        _ => {}
-                    }
+                    let _ = PostMessageW(Some(parent), WM_FLYOUT_ACTION, WPARAM(action), LPARAM(payload));
                 }
                 LRESULT(0)
             }
@@ -415,16 +392,56 @@ unsafe extern "system" fn flyout_wnd_proc(
                 let x = (lparam.0 & 0xFFFF) as i16 as i32;
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
                 let zone = hit_test(x, y);
-                if zone != HOVER_INDEX.load(Ordering::Relaxed) {
-                    HOVER_INDEX.store(zone, Ordering::Relaxed);
+                if HOVER_INDEX.swap(zone, Ordering::Relaxed) != zone {
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
+                // Re-arm every move: TME_LEAVE is one-shot and cheap to request.
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut tme);
                 LRESULT(0)
             }
             WM_DESTROY => LRESULT(0),
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
     }
+}
+
+/// Hides on focus loss and remembers when, for the tray re-open race in `toggle`.
+unsafe fn auto_hide(hwnd: HWND) {
+    unsafe {
+        if IsWindowVisible(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            LAST_AUTO_HIDE.with(|t| t.set(Some(Instant::now())));
+        }
+    }
+}
+
+/// Maps a clicked zone to the (action, lparam) posted to the main window.
+fn zone_action(zone: i32) -> Option<(usize, isize)> {
+    if let Some((_, color)) = SWATCHES.iter().find(|(z, _)| *z == zone) {
+        return Some((ACTION_SET_COLOR, color.to_abgr() as isize));
+    }
+    let action = match zone {
+        ZONE_PRESET_CLEAR => ACTION_SET_CLEAR,
+        ZONE_PRESET_BLUR => ACTION_SET_BLUR,
+        ZONE_PRESET_ACRYLIC => ACTION_SET_ACRYLIC,
+        ZONE_PRESET_OPAQUE => ACTION_SET_OPAQUE,
+        ZONE_PRESET_DEFAULT => ACTION_SET_DEFAULT,
+        ZONE_TOGGLE_DYNAMIC => ACTION_TOGGLE_DYNAMIC,
+        ZONE_TOGGLE_SMOOTH => ACTION_TOGGLE_SMOOTH,
+        ZONE_TOGGLE_GAME => ACTION_TOGGLE_GAME_MODE,
+        ZONE_TOGGLE_BORDER => ACTION_TOGGLE_BORDER,
+        ZONE_BTN_CONFIG => ACTION_OPEN_CONFIG,
+        ZONE_BTN_RESTART_SHELL => ACTION_RESTART_EXPLORER,
+        ZONE_BTN_EXIT => ACTION_EXIT,
+        _ => return None,
+    };
+    Some((action, 0))
 }
 
 fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
@@ -503,11 +520,9 @@ unsafe fn draw_toggle(hdc: HDC, x: i32, y: i32, active: bool) {
 
 unsafe fn render_flyout(hdc: HDC, width: i32, height: i32) {
     unsafe {
-        let state = if let Ok(lock) = FLYOUT_DATA.lock() {
-            lock.clone().unwrap_or_default()
-        } else {
-            FlyoutState::default()
-        };
+        let state = FLYOUT_DATA.with(|d| d.borrow().clone());
+        let (font_title, font_section, font_body, font_sub) =
+            FONTS.with(|f| (f.title, f.section, f.body, f.sub));
         let hover = HOVER_INDEX.load(Ordering::Relaxed);
 
         let bg_brush = CreateSolidBrush(rgb(25, 25, 28));
@@ -530,27 +545,6 @@ unsafe fn render_flyout(hdc: HDC, width: i32, height: i32) {
 
         SetBkMode(hdc, TRANSPARENT);
 
-        let font_title = CreateFontW(
-            20, 0, 0, 0, FW_BOLD.0 as i32, 0, 0, 0, DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0,
-            w!("Segoe UI Variable Display"),
-        );
-        let font_section = CreateFontW(
-            12, 0, 0, 0, FW_BOLD.0 as i32, 0, 0, 0, DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0,
-            w!("Segoe UI"),
-        );
-        let font_body = CreateFontW(
-            14, 0, 0, 0, FW_SEMIBOLD.0 as i32, 0, 0, 0, DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0,
-            w!("Segoe UI Variable Text"),
-        );
-        let font_sub = CreateFontW(
-            11, 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0,
-            w!("Segoe UI"),
-        );
-
         // HEADER
         let old_font = SelectObject(hdc, font_title.into());
         SetTextColor(hdc, rgb(255, 255, 255));
@@ -562,7 +556,8 @@ unsafe fn render_flyout(hdc: HDC, width: i32, height: i32) {
         SelectObject(hdc, font_sub.into());
         SetTextColor(hdc, rgb(52, 211, 153));
         let mut status_rc = RECT { left: 18, top: 36, right: 300, bottom: 52 };
-        let mut status_txt: Vec<u16> = "● Win11 XAML Engine Active • v1.0\0".encode_utf16().collect();
+        let status = format!("● {} engine active • v{}\0", state.engine, env!("CARGO_PKG_VERSION"));
+        let mut status_txt: Vec<u16> = status.encode_utf16().collect();
         let len = status_txt.len();
         let _ = DrawTextW(hdc, &mut status_txt[..len - 1], &mut status_rc, DT_LEFT | DT_SINGLELINE);
 
@@ -605,12 +600,11 @@ unsafe fn render_flyout(hdc: HDC, width: i32, height: i32) {
         let len = sec2_txt.len();
         let _ = DrawTextW(hdc, &mut sec2_txt[..len - 1], &mut sec2_rc, DT_LEFT | DT_SINGLELINE);
 
-        draw_swatch(hdc, 35, 196, rgb(0, 0, 0), "Black", hover == ZONE_SWATCH_BLACK, state.current_color == Color::new(0,0,0,255));
-        draw_swatch(hdc, 80, 196, rgb(24, 24, 28), "Slate", hover == ZONE_SWATCH_SLATE, state.current_color == Color::new(24,24,28,255));
-        draw_swatch(hdc, 125, 196, rgb(14, 30, 56), "Navy", hover == ZONE_SWATCH_NAVY, state.current_color == Color::new(14,30,56,255));
-        draw_swatch(hdc, 170, 196, rgb(50, 12, 18), "Crimson", hover == ZONE_SWATCH_CRIMSON, state.current_color == Color::new(50,12,18,255));
-        draw_swatch(hdc, 215, 196, rgb(10, 42, 26), "Emerald", hover == ZONE_SWATCH_EMERALD, state.current_color == Color::new(10,42,26,255));
-        draw_swatch(hdc, 260, 196, rgb(255, 255, 255), "White", hover == ZONE_SWATCH_WHITE, state.current_color == Color::new(255,255,255,255));
+        for (i, (zone, color)) in SWATCHES.iter().enumerate() {
+            let cx = 35 + 45 * i as i32;
+            let fill = rgb(color.r, color.g, color.b);
+            draw_swatch(hdc, cx, 196, fill, hover == *zone, state.current_color == *color);
+        }
 
         // SECTION 3: AUTOMATIONS & TOGGLES
         SelectObject(hdc, font_section.into());
@@ -620,9 +614,9 @@ unsafe fn render_flyout(hdc: HDC, width: i32, height: i32) {
         let len = sec3_txt.len();
         let _ = DrawTextW(hdc, &mut sec3_txt[..len - 1], &mut sec3_rc, DT_LEFT | DT_SINGLELINE);
 
-        draw_toggle_row(hdc, 16, 258, 318, 34, "Dynamic Auto-Detect", "Adapt on maximize / start menu", state.dynamic_enabled, hover == ZONE_TOGGLE_DYNAMIC, font_body, font_sub);
+        draw_toggle_row(hdc, 16, 258, 318, 34, "Dynamic Auto-Detect", "Adapt on maximize / start menu", state.dynamic_enabled && !state.is_forced, hover == ZONE_TOGGLE_DYNAMIC, font_body, font_sub);
         draw_toggle_row(hdc, 16, 296, 318, 34, "Smooth 60fps Animations", "Cubic fade transitions between states", state.smooth_enabled, hover == ZONE_TOGGLE_SMOOTH, font_body, font_sub);
-        draw_toggle_row(hdc, 16, 334, 318, 34, "Fullscreen Game Sleep", "0% CPU pause in games (anti-cheat safe)", state.game_pause_enabled, hover == ZONE_TOGGLE_GAME, font_body, font_sub);
+        draw_toggle_row(hdc, 16, 334, 318, 34, "Fullscreen Game Sleep", "Stock taskbar while a fullscreen app runs", state.game_pause_enabled, hover == ZONE_TOGGLE_GAME, font_body, font_sub);
         draw_toggle_row(hdc, 16, 372, 318, 34, "Taskbar Top Border Line", "Subtle accent line on top of bar", state.show_border, hover == ZONE_TOGGLE_BORDER, font_body, font_sub);
 
         // Status badge
@@ -644,14 +638,10 @@ unsafe fn render_flyout(hdc: HDC, width: i32, height: i32) {
 
         // SECTION 4: FOOTER ACTIONS
         draw_action_btn(hdc, 16, 464, 98, 34, "Config JSON", hover == ZONE_BTN_CONFIG, rgb(40, 40, 48), font_body);
-        draw_action_btn(hdc, 120, 464, 108, 34, "Restart Shell", hover == ZONE_BTN_RELOAD, rgb(40, 40, 48), font_body);
+        draw_action_btn(hdc, 120, 464, 108, 34, "Restart Shell", hover == ZONE_BTN_RESTART_SHELL, rgb(40, 40, 48), font_body);
         draw_action_btn(hdc, 234, 464, 100, 34, "Exit Mutatio", hover == ZONE_BTN_EXIT, rgb(60, 25, 28), font_body);
 
         SelectObject(hdc, old_font);
-        let _ = DeleteObject(font_title.into());
-        let _ = DeleteObject(font_section.into());
-        let _ = DeleteObject(font_body.into());
-        let _ = DeleteObject(font_sub.into());
     }
 }
 
@@ -708,7 +698,6 @@ unsafe fn draw_swatch(
     cx: i32,
     cy: i32,
     color: COLORREF,
-    _name: &str,
     is_hover: bool,
     is_selected: bool,
 ) {
@@ -795,5 +784,32 @@ unsafe fn draw_action_btn(
         let mut txt: Vec<u16> = format!("{}\0", title).encode_utf16().collect();
         let len = txt.len();
         let _ = DrawTextW(hdc, &mut txt[..len - 1], &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_zone_maps_to_an_action_or_close() {
+        for &(zone, ..) in HIT_ZONES {
+            assert!(zone == ZONE_CLOSE || zone_action(zone).is_some(), "zone {zone} does nothing");
+        }
+    }
+
+    #[test]
+    fn hit_test_samples() {
+        assert_eq!(hit_test(66, 90), ZONE_PRESET_CLEAR);
+        assert_eq!(hit_test(35, 210), ZONE_SWATCH_BLACK);
+        assert_eq!(hit_test(170, 480), ZONE_BTN_RESTART_SHELL);
+        assert_eq!(hit_test(5, 5), -1);
+    }
+
+    #[test]
+    fn swatch_click_carries_its_color() {
+        let (action, lp) = zone_action(ZONE_SWATCH_NAVY).unwrap();
+        assert_eq!(action, ACTION_SET_COLOR);
+        assert_eq!(Color::from_abgr(lp as u32), Color::new(14, 30, 56, 255));
     }
 }

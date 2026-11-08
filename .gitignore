@@ -1,6 +1,6 @@
 # Rust build artifacts
 /target
-Cargo.lock
+# Cargo.lock is committed: this is a binary crate, builds must be reproducible
 
 # Windows temporary / dump files
 *.pdb
@@ -19,3 +19,7 @@ Cargo.lock
 mutatio.json
 out.txt
 err.txt
+
+# Installer output and generated wizard art
+/dist
+/installer/build

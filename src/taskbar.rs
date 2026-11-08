@@ -1,4 +1,5 @@
-use crate::config::{Color, StateAppearance, TaskbarState};
+use crate::config::{StateAppearance, TaskbarState};
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::fs;
 use std::path::PathBuf;
@@ -12,15 +13,28 @@ use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::StationsAndDesktops::{
     OpenDesktopW, SetThreadDesktop, DESKTOP_CONTROL_FLAGS,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, FindWindowW, ShowWindow, SW_HIDE, SW_SHOWNA,
-};
+use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, FindWindowW};
 
 // Embedded ExplorerTAP DLL for self-contained Windows 11 Modern Taskbar support
 const EMBEDDED_EXPLORER_TAP: &[u8] = include_bytes!("../assets/ExplorerTAP.dll");
 
 pub const IID_ITASKBAR_APPEARANCE_SERVICE: GUID =
     GUID::from_u128(0x5bcf9150_c28a_4ef2_913c_4c3ea2f5ead0);
+
+/// HRESULTs a COM proxy returns once the server process (explorer.exe) is gone.
+/// Seeing one means our `ITaskbarAppearanceService` pointer is dead and must be rebuilt.
+const DEAD_SERVER_HRESULTS: [u32; 6] = [
+    0x8001_0108, // RPC_E_DISCONNECTED
+    0x8001_0007, // RPC_E_SERVER_DIED
+    0x8001_0012, // RPC_E_SERVER_DIED_DNE
+    0x8007_06BA, // RPC_S_SERVER_UNAVAILABLE
+    0x8007_06BE, // RPC_S_CALL_FAILED
+    0x8004_01FD, // CO_E_OBJNOTCONNECTED
+];
+
+fn is_dead_server(hr: HRESULT) -> bool {
+    DEAD_SERVER_HRESULTS.contains(&(hr.0 as u32))
+}
 
 #[repr(i32)]
 #[derive(Debug, Clone, Copy)]
@@ -30,19 +44,15 @@ pub enum TaskbarBrush {
 }
 
 // COM vtable function pointer definitions
-type FnSetTaskbarAppearance =
-    unsafe extern "system" fn(*mut c_void, HWND, i32, u32) -> HRESULT;
-type FnSetTaskbarBlur =
-    unsafe extern "system" fn(*mut c_void, HWND, u32, f32) -> HRESULT;
-type FnReturnTaskbarToDefaultAppearance =
-    unsafe extern "system" fn(*mut c_void, HWND) -> HRESULT;
-type FnSetTaskbarBorderVisibility =
-    unsafe extern "system" fn(*mut c_void, HWND, BOOL) -> HRESULT;
-type FnRestoreAllTaskbarsToDefault =
-    unsafe extern "system" fn(*mut c_void) -> HRESULT;
-type FnRelease =
-    unsafe extern "system" fn(*mut c_void) -> u32;
+type FnSetTaskbarAppearance = unsafe extern "system" fn(*mut c_void, HWND, i32, u32) -> HRESULT;
+type FnSetTaskbarBlur = unsafe extern "system" fn(*mut c_void, HWND, u32, f32) -> HRESULT;
+type FnReturnTaskbarToDefaultAppearance = unsafe extern "system" fn(*mut c_void, HWND) -> HRESULT;
+type FnSetTaskbarBorderVisibility = unsafe extern "system" fn(*mut c_void, HWND, BOOL) -> HRESULT;
+type FnRestoreAllTaskbarsToDefault = unsafe extern "system" fn(*mut c_void) -> HRESULT;
+type FnRelease = unsafe extern "system" fn(*mut c_void) -> u32;
 
+/// Hand-rolled binding of ExplorerTAP's `ITaskbarAppearanceService`.
+/// Vtable slot order MUST match the DLL's IDL exactly — nothing type-checks this.
 pub struct TaskbarAppearanceService {
     p_unk: *mut c_void,
     fn_set_appearance: FnSetTaskbarAppearance,
@@ -53,34 +63,27 @@ pub struct TaskbarAppearanceService {
     fn_release: FnRelease,
 }
 
-unsafe impl Send for TaskbarAppearanceService {}
-unsafe impl Sync for TaskbarAppearanceService {}
-
 impl TaskbarAppearanceService {
+    /// # Safety
+    /// `p_unk` must be a live `ITaskbarAppearanceService*` whose reference we now own.
     pub unsafe fn from_raw(p_unk: *mut c_void) -> Option<Self> {
         if p_unk.is_null() {
             return None;
         }
 
         unsafe {
-            let vtable_ptr = *(p_unk as *const *const *const c_void);
-            let vtable = std::slice::from_raw_parts(vtable_ptr, 10);
-
-            let fn_release: FnRelease = std::mem::transmute(vtable[2]);
-            let fn_set_appearance: FnSetTaskbarAppearance = std::mem::transmute(vtable[3]);
-            let fn_set_blur: FnSetTaskbarBlur = std::mem::transmute(vtable[4]);
-            let fn_return_default: FnReturnTaskbarToDefaultAppearance = std::mem::transmute(vtable[5]);
-            let fn_set_border: FnSetTaskbarBorderVisibility = std::mem::transmute(vtable[6]);
-            let fn_restore_all: FnRestoreAllTaskbarsToDefault = std::mem::transmute(vtable[7]);
-
+            let vtable = *(p_unk as *const *const *const c_void);
+            // Read only the slots we use. The old code built a 10-entry slice; a proxy vtable is
+            // exactly as long as the interface, so that read past its end.
+            let slot = |i: usize| *vtable.add(i);
             Some(Self {
                 p_unk,
-                fn_set_appearance,
-                fn_set_blur,
-                fn_return_default,
-                fn_set_border,
-                fn_restore_all,
-                fn_release,
+                fn_release: std::mem::transmute::<*const c_void, FnRelease>(slot(2)),
+                fn_set_appearance: std::mem::transmute::<*const c_void, FnSetTaskbarAppearance>(slot(3)),
+                fn_set_blur: std::mem::transmute::<*const c_void, FnSetTaskbarBlur>(slot(4)),
+                fn_return_default: std::mem::transmute::<*const c_void, FnReturnTaskbarToDefaultAppearance>(slot(5)),
+                fn_set_border: std::mem::transmute::<*const c_void, FnSetTaskbarBorderVisibility>(slot(6)),
+                fn_restore_all: std::mem::transmute::<*const c_void, FnRestoreAllTaskbarsToDefault>(slot(7)),
             })
         }
     }
@@ -108,129 +111,133 @@ impl TaskbarAppearanceService {
 
 impl Drop for TaskbarAppearanceService {
     fn drop(&mut self) {
+        // Only Release here. Restoring is an explicit decision of the controller: on reconnect
+        // the server is already dead, and restore-on-drop made exit restore three times.
         unsafe {
-            let _ = self.restore_all();
             (self.fn_release)(self.p_unk);
         }
     }
 }
 
 // Undocumented SetWindowCompositionAttribute definitions (Win10 fallback)
-pub const WCA_ACCENT_POLICY: u32 = 19;
-pub const ACCENT_DISABLED: u32 = 0;
-pub const ACCENT_ENABLE_GRADIENT: u32 = 1;
-pub const ACCENT_ENABLE_TRANSPARENTGRADIENT: u32 = 2;
-pub const ACCENT_ENABLE_BLURBEHIND: u32 = 3;
-pub const ACCENT_ENABLE_ACRYLICBLURBEHIND: u32 = 4;
+const WCA_ACCENT_POLICY: u32 = 19;
+const ACCENT_DISABLED: u32 = 0;
+const ACCENT_ENABLE_GRADIENT: u32 = 1;
+const ACCENT_ENABLE_TRANSPARENTGRADIENT: u32 = 2;
+const ACCENT_ENABLE_BLURBEHIND: u32 = 3;
+const ACCENT_ENABLE_ACRYLICBLURBEHIND: u32 = 4;
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct AccentPolicy {
-    pub accent_state: u32,
-    pub accent_flags: u32,
-    pub gradient_color: u32,
-    pub animation_id: u32,
+struct AccentPolicy {
+    accent_state: u32,
+    accent_flags: u32,
+    gradient_color: u32,
+    animation_id: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct WindowCompositionAttribData {
-    pub attrib: u32,
-    pub pv_data: *mut c_void,
-    pub cb_data: usize,
+struct WindowCompositionAttribData {
+    attrib: u32,
+    pv_data: *mut c_void,
+    cb_data: usize,
 }
 
 type PfnSetWindowCompositionAttribute =
     unsafe extern "system" fn(HWND, *const WindowCompositionAttribData) -> BOOL;
 
-type PfnInjectExplorerTAP =
-    unsafe extern "C" fn(HWND, *const GUID, *mut *mut c_void) -> HRESULT;
+type PfnInjectExplorerTAP = unsafe extern "C" fn(HWND, *const GUID, *mut *mut c_void) -> HRESULT;
 
 pub struct TaskbarController {
     pfn_swca: Option<PfnSetWindowCompositionAttribute>,
     tap_service: Option<TaskbarAppearanceService>,
-}
-
-#[derive(Debug, Clone)]
-pub struct TaskbarInfo {
-    pub main_hwnd: HWND,
-    pub worker_w: Option<HWND>,
-    #[allow(dead_code)]
-    pub is_secondary: bool,
+    /// Set from `apply` (which only has `&self`) when a COM call reports explorer died.
+    tap_dead: Cell<bool>,
+    com_initialized: bool,
 }
 
 impl TaskbarController {
     pub fn new() -> Self {
         unsafe {
-            // Ensure thread is attached to user's interactive Default desktop
-            if let Ok(hdesk) = OpenDesktopW(
-                w!("Default"),
-                DESKTOP_CONTROL_FLAGS(0),
-                false,
-                0x10000000,
-            ) {
+            // Attach this thread to the interactive desktop once. The old code also did this inside
+            // find_taskbars() whenever explorer was down — leaking a desktop handle on every
+            // animation frame until explorer came back.
+            if let Ok(hdesk) = OpenDesktopW(w!("Default"), DESKTOP_CONTROL_FLAGS(0), false, 0x1000_0000) {
                 let _ = SetThreadDesktop(hdesk);
             }
-
-            // Initialize COM for this thread
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         }
 
+        // S_FALSE ("already initialized") still needs a matching CoUninitialize;
+        // RPC_E_CHANGED_MODE must not get one.
+        let com_initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok() };
+
         let pfn_swca = unsafe {
-            let user32 = LoadLibraryW(w!("user32.dll")).ok();
-            if let Some(hmod) = user32 {
-                let proc = GetProcAddress(hmod, windows::core::s!("SetWindowCompositionAttribute"));
-                proc.map(|p| std::mem::transmute::<_, PfnSetWindowCompositionAttribute>(p))
-            } else {
-                None
-            }
+            LoadLibraryW(w!("user32.dll")).ok().and_then(|hmod| {
+                GetProcAddress(hmod, windows::core::s!("SetWindowCompositionAttribute")).map(|p| {
+                    std::mem::transmute::<unsafe extern "system" fn() -> isize, PfnSetWindowCompositionAttribute>(p)
+                })
+            })
         };
 
-        let mut tap_service = None;
+        let mut controller = Self {
+            pfn_swca,
+            tap_service: None,
+            tap_dead: Cell::new(false),
+            com_initialized,
+        };
 
-        // Try initializing Windows 11 Modern XAML Taskbar TAP Service
-        if let Some(service) = Self::init_tap_service() {
+        if controller.reconnect() {
             println!("[+] Windows 11 Modern Taskbar XAML Engine connected successfully");
-            tap_service = Some(service);
         } else {
             println!("[*] Using Native DWM / SWCA fallback engine");
         }
+        controller
+    }
 
-        Self {
-            pfn_swca,
-            tap_service,
-        }
+    pub fn is_modern(&self) -> bool {
+        self.tap_service.is_some()
+    }
+
+    pub fn engine_name(&self) -> &'static str {
+        if self.is_modern() { "Win11 XAML" } else { "DWM / SWCA" }
+    }
+
+    /// True once a COM call has failed because explorer.exe went away.
+    pub fn is_disconnected(&self) -> bool {
+        self.tap_dead.get()
+    }
+
+    /// (Re)creates the ExplorerTAP connection. Call after explorer restarts (TaskbarCreated).
+    pub fn reconnect(&mut self) -> bool {
+        // Drop the stale proxy first; Release on a dead proxy is harmless.
+        self.tap_service = None;
+        self.tap_dead.set(false);
+        self.tap_service = Self::init_tap_service();
+        self.tap_service.is_some()
     }
 
     fn init_tap_service() -> Option<TaskbarAppearanceService> {
-        let primary_hwnd = unsafe {
-            let h = FindWindowW(w!("Shell_TrayWnd"), None).ok()?;
-            if h.0 as usize == 0 {
-                return None;
-            }
-            h
-        };
+        let primary_hwnd = unsafe { FindWindowW(w!("Shell_TrayWnd"), None).ok()? };
+        if primary_hwnd.is_invalid() {
+            return None;
+        }
 
-        // Ensure ExplorerTAP.dll exists in LocalAppData
         let tap_dll_path = Self::ensure_tap_dll()?;
 
         unsafe {
             let path_w: Vec<u16> = tap_dll_path
+                .as_os_str()
                 .to_string_lossy()
                 .encode_utf16()
                 .chain(std::iter::once(0))
                 .collect();
 
+            // LoadLibrary is ref-counted, so calling this again on reconnect is cheap.
             let h_module = LoadLibraryW(windows::core::PCWSTR(path_w.as_ptr())).ok()?;
             let proc_inject = GetProcAddress(h_module, windows::core::s!("InjectExplorerTAP"))?;
             let pfn_inject: PfnInjectExplorerTAP = std::mem::transmute(proc_inject);
 
             let mut p_service: *mut c_void = std::ptr::null_mut();
-            let hr = pfn_inject(
-                primary_hwnd,
-                &IID_ITASKBAR_APPEARANCE_SERVICE,
-                &mut p_service,
-            );
+            let hr = pfn_inject(primary_hwnd, &IID_ITASKBAR_APPEARANCE_SERVICE, &mut p_service);
 
             if hr.is_ok() && !p_service.is_null() {
                 TaskbarAppearanceService::from_raw(p_service)
@@ -249,203 +256,129 @@ impl TaskbarController {
         let _ = fs::create_dir_all(&tap_dir);
         let tap_path = tap_dir.join("ExplorerTAP.dll");
 
-        let need_write = if tap_path.exists() {
-            fs::metadata(&tap_path)
-                .map(|m| m.len() != EMBEDDED_EXPLORER_TAP.len() as u64)
-                .unwrap_or(true)
-        } else {
-            true
-        };
+        // Compare full contents, not just length: a same-size rebuild of the DLL would otherwise
+        // never be updated. 550 KB read once at startup is negligible.
+        let up_to_date = fs::read(&tap_path).is_ok_and(|bytes| bytes == EMBEDDED_EXPLORER_TAP);
 
-        if need_write {
-            if fs::write(&tap_path, EMBEDDED_EXPLORER_TAP).is_err() {
-                return None;
-            }
+        // A failed write is fatal only if the file on disk is wrong. (It can be locked because
+        // explorer still has it loaded from a previous run — that's fine when it's identical.)
+        if !up_to_date && fs::write(&tap_path, EMBEDDED_EXPLORER_TAP).is_err() {
+            return None;
         }
 
         Some(tap_path)
     }
 
     /// Finds all primary and secondary taskbars
-    pub fn find_taskbars(&self) -> Vec<TaskbarInfo> {
+    pub fn find_taskbars(&self) -> Vec<HWND> {
         let mut taskbars = Vec::new();
 
         unsafe {
-            // 1. Primary taskbar
-            let primary = FindWindowW(w!("Shell_TrayWnd"), None);
-            let hwnd = match primary {
-                Ok(h) if h.0 as usize != 0 => Some(h),
-                _ => {
-                    if let Ok(hdesk) = OpenDesktopW(
-                        w!("Default"),
-                        DESKTOP_CONTROL_FLAGS(0),
-                        false,
-                        0x10000000,
-                    ) {
-                        if SetThreadDesktop(hdesk).is_ok() {
-                            FindWindowW(w!("Shell_TrayWnd"), None)
-                                .ok()
-                                .filter(|h| h.0 as usize != 0)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                }
-            };
-
-            if let Some(h) = hwnd {
-                taskbars.push(TaskbarInfo {
-                    main_hwnd: h,
-                    worker_w: None,
-                    is_secondary: false,
-                });
+            if let Ok(h) = FindWindowW(w!("Shell_TrayWnd"), None) {
+                taskbars.push(h);
             }
 
-            // 2. Secondary taskbars
-            let mut sec = HWND::default();
-            loop {
-                let next_sec = FindWindowExW(None, Some(sec), w!("Shell_SecondaryTrayWnd"), None);
-                match next_sec {
-                    Ok(h) if h.0 as usize != 0 => {
-                        taskbars.push(TaskbarInfo {
-                            main_hwnd: h,
-                            worker_w: None,
-                            is_secondary: true,
-                        });
-                        sec = h;
-                    }
-                    _ => break,
-                }
+            let mut prev = HWND::default();
+            while let Ok(h) = FindWindowExW(None, Some(prev), w!("Shell_SecondaryTrayWnd"), None) {
+                taskbars.push(h);
+                prev = h;
             }
         }
 
         taskbars
     }
 
-    /// Applies state appearance to all found taskbars
-    pub fn apply_to_all(&self, appearance: &StateAppearance) {
-        let taskbars = self.find_taskbars();
-        for tb in &taskbars {
-            self.apply_to_taskbar(tb, appearance);
-        }
-    }
-
     /// Applies appearance to a single taskbar
-    pub fn apply_to_taskbar(&self, tb: &TaskbarInfo, appearance: &StateAppearance) {
-        // Modern Windows 11 XAML Engine
+    pub fn apply(&self, taskbar: HWND, appearance: &StateAppearance) {
         if let Some(ref service) = self.tap_service {
-            match appearance.state {
-                TaskbarState::Normal => {
-                    let _ = service.return_to_default(tb.main_hwnd);
-                }
+            let color = appearance.color;
+            let hr = match appearance.state {
+                TaskbarState::Normal => service.return_to_default(taskbar),
                 TaskbarState::Clear => {
-                    let abgr = appearance.color.to_abgr();
-                    let _ = service.set_appearance(tb.main_hwnd, TaskbarBrush::SolidColor, abgr);
+                    service.set_appearance(taskbar, TaskbarBrush::SolidColor, color.to_abgr())
                 }
                 TaskbarState::Opaque => {
-                    let mut col = appearance.color;
-                    if (col.r == 24 && col.g == 24 && col.b == 24) || (col.r == 0 && col.g == 0 && col.b == 0) {
-                        col = Color::new(0, 0, 0, 255);
-                    }
-                    col.a = 255;
-                    let _ = service.set_appearance(tb.main_hwnd, TaskbarBrush::SolidColor, col.to_abgr());
+                    // Opaque means opaque: force alpha only. (The old code also silently remapped
+                    // #181818 to #000000, so the user could never pick that color.)
+                    let solid = crate::config::Color { a: 255, ..color };
+                    service.set_appearance(taskbar, TaskbarBrush::SolidColor, solid.to_abgr())
                 }
-                TaskbarState::Blur => {
-                    let abgr = appearance.color.to_abgr();
-                    let _ = service.set_blur(tb.main_hwnd, abgr, 10.0);
-                }
+                TaskbarState::Blur => service.set_blur(taskbar, color.to_abgr(), 10.0),
                 TaskbarState::Acrylic => {
-                    let mut col = appearance.color;
-                    if col.a == 0 {
-                        col.a = 1;
-                    }
-                    let _ = service.set_appearance(tb.main_hwnd, TaskbarBrush::Acrylic, col.to_abgr());
+                    // Alpha 0 acrylic renders as plain transparent; keep a hint of tint.
+                    let tinted = crate::config::Color { a: color.a.max(1), ..color };
+                    service.set_appearance(taskbar, TaskbarBrush::Acrylic, tinted.to_abgr())
                 }
-            }
+            };
+            let hr_border = service.set_border_visibility(taskbar, appearance.show_line);
 
-            let _ = service.set_border_visibility(tb.main_hwnd, appearance.show_line);
+            if is_dead_server(hr) || is_dead_server(hr_border) {
+                self.tap_dead.set(true);
+            }
             return;
         }
 
-        // Fallback for Windows 10 & ExplorerPatcher / Classic Taskbar
+        self.apply_swca(taskbar, appearance);
+    }
+
+    /// Fallback for Windows 10 & ExplorerPatcher / Classic Taskbar
+    fn apply_swca(&self, taskbar: HWND, appearance: &StateAppearance) {
+        let color = appearance.color;
+        let (accent_state, accent_flags, color_val) = match appearance.state {
+            TaskbarState::Normal => (ACCENT_DISABLED, 0, 0),
+            TaskbarState::Clear => (ACCENT_ENABLE_TRANSPARENTGRADIENT, 2, color.to_abgr()),
+            TaskbarState::Opaque => (
+                ACCENT_ENABLE_GRADIENT,
+                0,
+                crate::config::Color { a: 255, ..color }.to_abgr(),
+            ),
+            TaskbarState::Blur => (ACCENT_ENABLE_BLURBEHIND, 0, color.to_abgr()),
+            TaskbarState::Acrylic => (
+                ACCENT_ENABLE_ACRYLICBLURBEHIND,
+                0,
+                crate::config::Color { a: color.a.max(1), ..color }.to_abgr(),
+            ),
+        };
+
+        let mut policy = AccentPolicy {
+            accent_state,
+            accent_flags,
+            gradient_color: color_val,
+            animation_id: 0,
+        };
+
+        let data = WindowCompositionAttribData {
+            attrib: WCA_ACCENT_POLICY,
+            pv_data: &mut policy as *mut _ as *mut c_void,
+            cb_data: std::mem::size_of::<AccentPolicy>(),
+        };
+
         unsafe {
-            let (accent_state, accent_flags, color_val) = match appearance.state {
-                TaskbarState::Normal => (ACCENT_DISABLED, 0, 0),
-                TaskbarState::Clear => {
-                    let abgr = appearance.color.to_abgr();
-                    (ACCENT_ENABLE_TRANSPARENTGRADIENT, 2, abgr)
-                }
-                TaskbarState::Opaque => {
-                    let mut col = appearance.color;
-                    if (col.r == 24 && col.g == 24 && col.b == 24) || (col.r == 0 && col.g == 0 && col.b == 0) {
-                        col = Color::new(0, 0, 0, 255);
-                    }
-                    col.a = 255;
-                    (ACCENT_ENABLE_GRADIENT, 0, col.to_abgr())
-                }
-                TaskbarState::Blur => {
-                    let abgr = appearance.color.to_abgr();
-                    (ACCENT_ENABLE_BLURBEHIND, 0, abgr)
-                }
-                TaskbarState::Acrylic => {
-                    let mut col = appearance.color;
-                    if col.a == 0 {
-                        col.a = 1;
-                    }
-                    (ACCENT_ENABLE_ACRYLICBLURBEHIND, 0, col.to_abgr())
-                }
-            };
-
-            let mut policy = AccentPolicy {
-                accent_state,
-                accent_flags,
-                gradient_color: color_val,
-                animation_id: 0,
-            };
-
-            let data = WindowCompositionAttribData {
-                attrib: WCA_ACCENT_POLICY,
-                pv_data: &mut policy as *mut _ as *mut c_void,
-                cb_data: std::mem::size_of::<AccentPolicy>(),
-            };
-
             if let Some(swca) = self.pfn_swca {
-                let _ = swca(tb.main_hwnd, &data);
+                let _ = swca(taskbar, &data);
             }
 
             let backdrop_type: u32 = match appearance.state {
                 TaskbarState::Normal => 0,
-                TaskbarState::Clear => 1,
-                TaskbarState::Opaque => 1,
+                TaskbarState::Clear | TaskbarState::Opaque => 1,
                 TaskbarState::Blur => 2,
                 TaskbarState::Acrylic => 3,
             };
-
             let _ = DwmSetWindowAttribute(
-                tb.main_hwnd,
+                taskbar,
                 DWMWA_SYSTEMBACKDROP_TYPE,
                 &backdrop_type as *const _ as *const c_void,
                 std::mem::size_of::<u32>() as u32,
             );
 
-            let border_color: u32 = if appearance.show_line {
-                0xFFFFFFFF
-            } else {
-                0xFFFFFFFE
-            };
-
+            // DWMWA_COLOR_DEFAULT vs DWMWA_COLOR_NONE
+            let border_color: u32 = if appearance.show_line { 0xFFFF_FFFF } else { 0xFFFF_FFFE };
             let _ = DwmSetWindowAttribute(
-                tb.main_hwnd,
+                taskbar,
                 DWMWA_BORDER_COLOR,
                 &border_color as *const _ as *const c_void,
                 std::mem::size_of::<u32>() as u32,
             );
-
-            if let Some(worker) = tb.worker_w {
-                let _ = ShowWindow(worker, if appearance.show_line { SW_SHOWNA } else { SW_HIDE });
-            }
         }
     }
 
@@ -456,20 +389,20 @@ impl TaskbarController {
             return;
         }
 
-        let normal = StateAppearance {
-            state: TaskbarState::Normal,
-            color: Color::transparent(),
-            show_line: true,
-        };
-        self.apply_to_all(&normal);
+        let normal = StateAppearance::preset(TaskbarState::Normal);
+        for tb in self.find_taskbars() {
+            self.apply_swca(tb, &normal);
+        }
     }
 }
 
 impl Drop for TaskbarController {
     fn drop(&mut self) {
-        self.restore_all();
-        unsafe {
-            CoUninitialize();
+        // Order matters: the COM proxy must be released BEFORE CoUninitialize. Field drop glue
+        // runs after this body, so the old code released it on an already-uninitialized apartment.
+        self.tap_service = None;
+        if self.com_initialized {
+            unsafe { CoUninitialize() };
         }
     }
 }

@@ -1,0 +1,36 @@
+// Windows resources: application icon + version info shown in Explorer > Properties > Details.
+// Template: build.rs substitutes the @...@ placeholders from CARGO_PKG_VERSION and writes the
+// result to OUT_DIR, so Cargo.toml stays the single source of truth for the version number.
+#include <winver.h>
+
+// ID 1 = the icon Explorer uses for the .exe; tray.rs loads the same ID at runtime.
+1 ICON "@ICON_PATH@"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     @VER_COMMA@
+PRODUCTVERSION  @VER_COMMA@
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "projectGloria"
+            VALUE "FileDescription",  "Mutatio - Taskbar Appearance Engine"
+            VALUE "FileVersion",      "@VER_STR@"
+            VALUE "InternalName",     "mutatio"
+            VALUE "LegalCopyright",   "Copyright (c) Nihil. MIT License."
+            VALUE "OriginalFilename", "mutatio.exe"
+            VALUE "ProductName",      "Mutatio"
+            VALUE "ProductVersion",   "@VER_STR@"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

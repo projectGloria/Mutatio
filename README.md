@@ -88,48 +88,53 @@ flowchart TD
 
 ## 🚀 Quick Start
 
-### 1. Run the Background Daemon
-Double-click `mutatio.exe` or run from terminal:
-```powershell
-.\mutatio.exe
-```
-Mutatio will start in your system tray:
-- **Left-click** the tray icon: Opens the Flyout UI.
-- **Click outside**: Closes the UI.
+### 1. Install
+Download and run `Mutatio-Setup-<version>.exe`. It installs per-user (no admin rights needed) and offers to:
+- start Mutatio when you sign in,
+- add Mutatio to your `PATH` for the CLI,
+- create a desktop shortcut.
 
-### 2. Command Line Interface (CLI)
-You can control a running Mutatio instance or launch it with a preset:
+Uninstalling stops Mutatio and restores the stock taskbar. Your settings in `%APPDATA%\Mutatio` are kept.
+
+### 2. Run the Background Daemon
+Launch Mutatio from the Start menu, or run `mutatio` in a terminal. It runs in the system tray without a console window:
+- **Left-click** the tray icon: Opens the Flyout UI.
+- **Click outside / Esc**: Closes the UI.
+
+### 3. Command Line Interface (CLI)
+You can control a running Mutatio instance or launch it with a preset.
+Type `mutatio` without an extension: Windows picks the console front-end `mutatio.com` over the windowless `mutatio.exe`, so output prints normally in PowerShell and cmd.
 
 ```powershell
 # Set taskbar to 100% transparent
-mutatio.exe --clear
+mutatio --clear
 
 # Set taskbar to solid pitch black
-mutatio.exe --opaque
+mutatio --opaque
 
 # Set taskbar to Fluent Acrylic
-mutatio.exe --acrylic
+mutatio --acrylic
 
 # Set taskbar to Aero Blur
-mutatio.exe --blur
+mutatio --blur
 
 # Set taskbar to a custom HEX color
-mutatio.exe --color "#FF000000"
+mutatio --color "#FF000000"
 
 # Restore default Windows appearance
-mutatio.exe --normal
+mutatio --normal
 
-# Toggle between Dynamic and Forced modes
-mutatio.exe --toggle
+# Toggle dynamic auto-detection on/off (also clears a forced preset)
+mutatio --toggle
 
 # Reload configuration from disk
-mutatio.exe --reload
+mutatio --reload
 
-# Show daemon status
-mutatio.exe --status
+# Show daemon status (mode, engine, per-taskbar state)
+mutatio --status
 
 # Exit Mutatio cleanly and restore taskbars
-mutatio.exe --quit
+mutatio --quit
 ```
 
 ---
@@ -183,15 +188,20 @@ Configuration is stored at `%APPDATA%\Mutatio\config.json`:
 
 ### Build Steps
 ```powershell
-# Clone your repository
-git clone https://github.com/yourusername/mutatio.git
-cd mutatio
+git clone https://github.com/projectGloria/Mutatio.git
+cd Mutatio
 
-# Build optimized release binary
+# Release binaries (icon + version info are embedded by build.rs; needs the Windows SDK's rc.exe)
 cargo build --release
 ```
-The compiled, self-contained binary will be located at:
-`target/release/mutatio.exe`
+This produces `target/release/mutatio.exe` (tray daemon) and `target/release/mutatio-cli.exe` (console CLI, shipped as `mutatio.com`).
+
+### Building the Installer
+Requires [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`winget install JRSoftware.InnoSetup`):
+```powershell
+powershell -ExecutionPolicy Bypass -File installer\build.ps1
+```
+Output: `dist\Mutatio-Setup-<version>.exe`. The version is read from `Cargo.toml`.
 
 ---
 

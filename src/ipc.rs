@@ -1,18 +1,27 @@
 use serde::{Deserialize, Serialize};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{channel, Sender};
 use std::thread;
-use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+use std::time::Duration;
+use windows::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, HANDLE, HWND, LPARAM, WPARAM,
+};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ,
+    CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ,
     FILE_GENERIC_WRITE, FILE_SHARE_NONE, OPEN_EXISTING,
 };
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_MESSAGE,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, SetNamedPipeHandleState,
+    WaitNamedPipeW, NAMED_PIPE_MODE, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS,
     PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
+use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
 pub const PIPE_NAME: &str = r"\\.\pipe\mutatio";
-pub const PIPE_ACCESS_DUPLEX_VAL: u32 = 0x00000003;
+const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
+const BUF_SIZE: usize = 4096;
+
+/// Posted to the daemon's message window so its idle wait wakes up for a queued IPC command.
+pub const WM_MUTATIO_IPC: u32 = WM_APP + 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", content = "payload")]
@@ -43,146 +52,158 @@ pub struct IpcResponse {
     pub active_state: Option<String>,
 }
 
+impl IpcResponse {
+    pub fn ok(message: impl Into<String>) -> Self {
+        Self { success: true, message: message.into(), active_state: None }
+    }
+
+    pub fn err(message: impl Into<String>) -> Self {
+        Self { success: false, message: message.into(), active_state: None }
+    }
+}
+
+/// A command plus the channel the main thread answers on. The old server replied "success" the
+/// moment a command was queued, so `--status` could never report anything real.
+pub struct IpcRequest {
+    pub command: IpcCommand,
+    pub reply: Sender<IpcResponse>,
+}
+
 pub struct IpcServer;
 
 impl IpcServer {
-    pub fn start(cmd_sender: Sender<IpcCommand>) {
+    /// `wake_hwnd` is the daemon's message window (as a raw isize because HWND isn't Send).
+    pub fn start(cmd_sender: Sender<IpcRequest>, wake_hwnd: isize) {
         thread::spawn(move || {
-            let pipe_name_w: Vec<u16> = PIPE_NAME
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
+            let pipe_name_w: Vec<u16> = PIPE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
 
             loop {
-                unsafe {
-                    let h_pipe = CreateNamedPipeW(
+                let h_pipe = unsafe {
+                    CreateNamedPipeW(
                         windows::core::PCWSTR(pipe_name_w.as_ptr()),
-                        FILE_FLAGS_AND_ATTRIBUTES(PIPE_ACCESS_DUPLEX_VAL),
-                        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                        FILE_FLAGS_AND_ATTRIBUTES(PIPE_ACCESS_DUPLEX),
+                        // Reject SMB clients: the default pipe is reachable from the network.
+                        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                         PIPE_UNLIMITED_INSTANCES,
-                        512,
-                        512,
+                        BUF_SIZE as u32,
+                        BUF_SIZE as u32,
                         0,
                         None,
-                    );
+                    )
+                };
 
-                    if h_pipe == INVALID_HANDLE_VALUE {
-                        thread::sleep(std::time::Duration::from_millis(500));
-                        continue;
-                    }
+                if h_pipe.is_invalid() {
+                    thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
 
-                    let connected = ConnectNamedPipe(h_pipe, None).is_ok()
-                        || windows::Win32::Foundation::GetLastError().0 == 535; // ERROR_PIPE_CONNECTED
+                // Blocks this thread (not the UI thread) until a client arrives.
+                let connected = match unsafe { ConnectNamedPipe(h_pipe, None) } {
+                    Ok(()) => true,
+                    // Client connected between Create and Connect — still a valid connection.
+                    Err(_) => (unsafe { GetLastError() }) == ERROR_PIPE_CONNECTED,
+                };
 
-                    if connected {
-                        let mut buffer = [0u8; 1024];
-                        let mut bytes_read = 0u32;
-
-                        if ReadFile(
-                            h_pipe,
-                            Some(&mut buffer),
-                            Some(&mut bytes_read),
-                            None,
-                        )
-                        .is_ok()
-                            && bytes_read > 0
-                        {
-                            if let Ok(msg) = std::str::from_utf8(&buffer[..bytes_read as usize]) {
-                                let resp = if let Ok(cmd) = serde_json::from_str::<IpcCommand>(msg.trim()) {
-                                    let _ = cmd_sender.send(cmd);
-                                    IpcResponse {
-                                        success: true,
-                                        message: "Command processed successfully".to_string(),
-                                        active_state: None,
-                                    }
-                                } else {
-                                    IpcResponse {
-                                        success: false,
-                                        message: format!("Unrecognized command: {}", msg),
-                                        active_state: None,
-                                    }
-                                };
-
-                                if let Ok(resp_json) = serde_json::to_string(&resp) {
-                                    let mut written = 0u32;
-                                    let _ = WriteFile(
-                                        h_pipe,
-                                        Some(resp_json.as_bytes()),
-                                        Some(&mut written),
-                                        None,
-                                    );
-                                }
-                            }
-                        }
-
+                if connected {
+                    Self::serve_one(h_pipe, &cmd_sender, wake_hwnd);
+                    unsafe {
+                        let _ = FlushFileBuffers(h_pipe); // let the client read before we disconnect
                         let _ = DisconnectNamedPipe(h_pipe);
                     }
+                }
 
+                unsafe {
                     let _ = CloseHandle(h_pipe);
                 }
             }
         });
     }
 
-    /// Sends a command to the running server via named pipe
-    pub fn send_client_command(cmd: &IpcCommand) -> Result<IpcResponse, String> {
-        let pipe_name_w: Vec<u16> = PIPE_NAME
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
+    fn serve_one(h_pipe: HANDLE, cmd_sender: &Sender<IpcRequest>, wake_hwnd: isize) {
+        let Some(msg) = read_message(h_pipe) else { return };
 
-        let req_json = serde_json::to_string(cmd)
-            .map_err(|e| format!("Serialization error: {}", e))?;
-
-        unsafe {
-            let h_pipe = CreateFileW(
-                windows::core::PCWSTR(pipe_name_w.as_ptr()),
-                FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
-                FILE_SHARE_NONE,
-                None,
-                OPEN_EXISTING,
-                FILE_FLAGS_AND_ATTRIBUTES(0),
-                None,
-            );
-
-            if h_pipe.is_err() || h_pipe.as_ref().unwrap().0 as usize == 0 {
-                return Err("Could not connect to Mutatio instance. Is it running?".to_string());
+        let resp = match serde_json::from_str::<IpcCommand>(msg.trim()) {
+            Ok(command) => {
+                let (reply_tx, reply_rx) = channel();
+                if cmd_sender.send(IpcRequest { command, reply: reply_tx }).is_err() {
+                    IpcResponse::err("Daemon is shutting down")
+                } else {
+                    unsafe {
+                        let _ = PostMessageW(
+                            Some(HWND(wake_hwnd as *mut _)),
+                            WM_MUTATIO_IPC,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    }
+                    reply_rx
+                        .recv_timeout(Duration::from_secs(3))
+                        .unwrap_or_else(|_| IpcResponse::err("Daemon did not respond in time"))
+                }
             }
+            Err(e) => IpcResponse::err(format!("Unrecognized command ({e})")),
+        };
 
-            let handle = h_pipe.unwrap();
-            let mut written = 0u32;
-            let write_res = WriteFile(
-                handle,
-                Some(req_json.as_bytes()),
-                Some(&mut written),
-                None,
-            );
-
-            if write_res.is_err() {
-                let _ = CloseHandle(handle);
-                return Err("Failed to write to Mutatio pipe".to_string());
-            }
-
-            let mut buffer = [0u8; 1024];
-            let mut read_bytes = 0u32;
-            let read_res = ReadFile(
-                handle,
-                Some(&mut buffer),
-                Some(&mut read_bytes),
-                None,
-            );
-
-            let _ = CloseHandle(handle);
-
-            if read_res.is_err() || read_bytes == 0 {
-                return Err("No response received from Mutatio".to_string());
-            }
-
-            let resp_str = std::str::from_utf8(&buffer[..read_bytes as usize])
-                .map_err(|e| format!("UTF8 error: {}", e))?;
-
-            serde_json::from_str::<IpcResponse>(resp_str)
-                .map_err(|e| format!("JSON parse error: {}", e))
+        if let Ok(json) = serde_json::to_string(&resp) {
+            write_message(h_pipe, json.as_bytes());
         }
     }
+
+    /// Sends a command to the running server via named pipe
+    pub fn send_client_command(cmd: &IpcCommand) -> Result<IpcResponse, String> {
+        let pipe_name_w: Vec<u16> = PIPE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+        let pipe_name = windows::core::PCWSTR(pipe_name_w.as_ptr());
+        let req_json = serde_json::to_string(cmd).map_err(|e| format!("Serialization error: {e}"))?;
+
+        unsafe {
+            // The server has exactly one listening instance and re-creates it after each client,
+            // so a concurrent client can see ERROR_PIPE_BUSY. Wait instead of failing — the old
+            // code treated "busy" as "not running" and spawned a second daemon.
+            let handle = loop {
+                match CreateFileW(
+                    pipe_name,
+                    FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
+                    FILE_SHARE_NONE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_FLAGS_AND_ATTRIBUTES(0),
+                    None,
+                ) {
+                    Ok(h) => break h,
+                    Err(e) if e.code() == ERROR_PIPE_BUSY.to_hresult() => {
+                        if !WaitNamedPipeW(pipe_name, 2000).as_bool() {
+                            return Err("Mutatio instance is busy".into());
+                        }
+                    }
+                    Err(_) => return Err("Could not connect to Mutatio instance. Is it running?".into()),
+                }
+            };
+
+            // Match the server's message mode so one ReadFile == one reply.
+            let mode = PIPE_READMODE_MESSAGE;
+            let _ = SetNamedPipeHandleState(handle, Some(&mode as *const NAMED_PIPE_MODE), None, None);
+
+            let ok = write_message(handle, req_json.as_bytes());
+            let reply = if ok { read_message(handle) } else { None };
+            let _ = CloseHandle(handle);
+
+            let reply = reply.ok_or("No response received from Mutatio")?;
+            serde_json::from_str::<IpcResponse>(&reply).map_err(|e| format!("JSON parse error: {e}"))
+        }
+    }
+}
+
+fn read_message(h: HANDLE) -> Option<String> {
+    let mut buffer = [0u8; BUF_SIZE];
+    let mut bytes_read = 0u32;
+    unsafe { ReadFile(h, Some(&mut buffer), Some(&mut bytes_read), None).ok()? };
+    if bytes_read == 0 {
+        return None;
+    }
+    String::from_utf8(buffer[..bytes_read as usize].to_vec()).ok()
+}
+
+fn write_message(h: HANDLE, bytes: &[u8]) -> bool {
+    let mut written = 0u32;
+    unsafe { WriteFile(h, Some(bytes), Some(&mut written), None).is_ok() }
 }

@@ -4,54 +4,57 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Mutatio is a Windows-only (x86_64, Win10/11) taskbar appearance daemon written in Rust (edition 2024, `windows` crate 0.62). Single binary: the same `mutatio.exe` acts as the tray daemon or as a CLI client that talks to a running daemon over a named pipe.
+Mutatio is a Windows-only (x86_64, Win10/11) taskbar appearance daemon written in Rust (edition 2024, `windows` crate 0.62). Two binaries share the code:
+- `mutatio` (`src/main.rs`, GUI subsystem in release): the tray daemon. It also accepts CLI flags.
+- `mutatio-cli` (`src/bin/mutatio-cli.rs`, console subsystem): pulls in `cli.rs`/`ipc.rs`/`config.rs` via `#[path]` and is installed as `mutatio.com`. A bare `mutatio` in a terminal resolves `.com` before `.exe`, so CLI output works in PowerShell while autostart/shortcuts get no console window.
+
+The version lives only in `Cargo.toml`. `build.rs` fills the `mutatio.rc` template (icon + VERSIONINFO) from it, and the installer reads it back from the built exe.
 
 ## Commands
 
 ```bash
-cargo build                 # debug
-cargo build --release       # LTO, codegen-units=1, panic=abort, stripped → target/release/mutatio.exe
-cargo clippy --all-targets
-cargo run                   # starts the daemon (tray icon + flyout); Ctrl+C or `--quit` from another shell
-cargo run -- --status       # CLI client mode against a running daemon
-cargo run -- --clear        # if no daemon is running, spawns one with `--daemon-start clear`
+cargo build                 # debug: console subsystem, daemon logs visible
+cargo build --release       # LTO, panic=abort, stripped, GUI subsystem → target/release/mutatio.exe
+cargo test                  # unit tests for pure logic (colors, config parsing, transitions, hit-testing)
+cargo test hex_parsing      # single test by name filter
+cargo clippy --all-targets  # keep this warning-free
+cargo run                   # start the daemon
+cargo run -- --status       # CLI client mode against a running daemon (prints per-taskbar state)
+powershell -ExecutionPolicy Bypass -File installer\build.ps1   # release build + Inno Setup installer → dist\
 ```
 
-There are no tests yet (`cargo test` runs nothing). Verification is manual: run the daemon and observe the real taskbar. Exiting the daemon restores the stock taskbar; if it crashes mid-transition, use `--normal` or restart explorer.
+The build needs the Windows SDK (`rc.exe`, found by `embed-resource`). The installer needs Inno Setup 6. `installer/build.ps1` generates the wizard BMPs from `Mutatio.jpg` into `installer/build/` (gitignored).
+
+Anything touching the shell must be verified manually: run the daemon, drive it with the CLI (`--status`, `--blur`, `--color`, `--toggle`, `--quit`), and look at the real taskbar. `--toggle` and flyout toggles persist to the user's real `%APPDATA%\Mutatio\config.json` — restore it after testing. Only one daemon can run. The named mutex `Local\Mutatio.Daemon` is *owned* by the daemon, so `--quit` blocks on it until the process has really exited; the uninstaller relies on this to delete the exe. Quit any running instance before testing.
 
 ## Architecture
 
-**Single-threaded main loop** (`src/main.rs`). `main()` owns all state (`config`, `force_preset`, `current_appearance`, `transition`) and runs a `PeekMessageW` loop rather than a blocking `GetMessage` loop. Each iteration:
-1. Drains Win32 messages — tray clicks (`WM_TRAYICON` → `WM_COMMAND`/`ID_TOGGLE_FLYOUT`) and flyout actions (`WM_FLYOUT_ACTION`, `wParam` = `ACTION_*` constant, `lParam` = packed ABGR color for `ACTION_SET_COLOR`).
-2. Drains IPC commands from an `mpsc` channel fed by the pipe thread.
-3. Every 50 ms, computes the target appearance: `force_preset` wins; else `StateDetector` (if `dynamic_modes_enabled`); else `config.desktop`.
-4. If the target differs, starts a `StateTransition` (or applies instantly), then steps it at ~16 ms; otherwise sleeps 25 ms.
+**Event-driven main loop** (`src/main.rs`). All state lives in `App` on the main (STA) thread. The loop drains messages, drains IPC requests, handles explorer restarts, re-runs detection if `DETECT_DIRTY` is set, steps animations, then blocks in `MsgWaitForMultipleObjectsEx`. Wake sources:
+- out-of-context WinEvent hooks (foreground, minimize, show/hide, location change, cloak) → `win_event_proc` only sets `DETECT_DIRTY`; detection is coalesced and capped at ~60 Hz;
+- `WM_MUTATIO_IPC` posted by the pipe thread;
+- 16 ms frames only while a transition runs; a 1 s safety poll otherwise.
 
-Note: despite the README's "0% idle CPU" claim, this is a polling loop (25 ms sleep / 50 ms detection). Don't describe it as event-driven.
+Don't reintroduce unconditional sleeps/polling in the loop.
 
-**Forced vs dynamic mode.** `force_preset: Option<StateAppearance>` is the "forced" override set by flyout presets, CLI `--clear/--blur/...`, and IPC `set_state`. `None` means dynamic detection is in charge. Color/border edits mutate `force_preset` if set, otherwise they mutate and persist `config.desktop`.
+**Per-taskbar slots.** Each `Shell_TrayWnd` / `Shell_SecondaryTrayWnd` is a `Slot` with its own monitor, detected `ActiveState`, current appearance and transition. `StateDetector::detect` (`src/monitor.rs`) does one `EnumWindows` pass and returns a state per monitor: Start/Search/fullscreen apply only to the foreground window's monitor; maximized/visible are any qualifying window on that monitor. Start/Search are identified by owning process (`StartMenuExperienceHost.exe`, `SearchHost.exe`, …), not by the localized window title.
 
-**Preset definitions are duplicated** in three places in `main.rs`: `--daemon-start` args, the `WM_FLYOUT_ACTION` handler, and the `IpcCommand::SetState` handler. Change a preset's color in all three (or refactor into one function).
+**Forced vs dynamic vs fixed.** `force_preset: Option<StateAppearance>` (flyout presets, `--clear` etc., IPC `set_state`) overrides everything. Otherwise `config.dynamic_modes_enabled` chooses detection vs. a fixed `config.desktop`. `App::toggle_dynamic` is the single implementation used by both the flyout switch and `--toggle`. Preset looks come from `StateAppearance::preset` and names from `TaskbarState::parse`/`name` — don't duplicate them.
 
-**Two rendering backends** (`src/taskbar.rs`, `TaskbarController`):
-- *Modern (Win11 XAML taskbar)*: `assets/ExplorerTAP.dll` is embedded via `include_bytes!`, written to `%LOCALAPPDATA%\Mutatio\ExplorerTAP.dll` (rewritten only when the file size differs), loaded, and its `InjectExplorerTAP` export injects into explorer to return an `ITaskbarAppearanceService` COM pointer. The vtable is called manually by index (slots 2–7: Release, SetTaskbarAppearance, SetTaskbarBlur, ReturnTaskbarToDefaultAppearance, SetTaskbarBorderVisibility, RestoreAllTaskbarsToDefault). Slot order must match the DLL exactly — there is no type checking.
-- *Fallback (Win10 / ExplorerPatcher)*: undocumented `SetWindowCompositionAttribute` (`WCA_ACCENT_POLICY`) on `Shell_TrayWnd` / `Shell_SecondaryTrayWnd`, plus `DwmSetWindowAttribute` for backdrop type and border color.
+**Two rendering backends** (`src/taskbar.rs`):
+- *Modern (Win11 XAML)*: `assets/ExplorerTAP.dll` (a prebuilt TranslucentTB binary) is embedded, written to `%LOCALAPPDATA%\Mutatio\` when its contents differ, and its `InjectExplorerTAP` export injects into explorer and returns an `ITaskbarAppearanceService` COM proxy. Methods are called by raw vtable slot (3–7); slot order must match the DLL exactly.
+- *Fallback (Win10 / ExplorerPatcher)*: `SetWindowCompositionAttribute` + DWM attributes. Explorer resets these on its own, so `update_targets` re-pushes them every detection pass; the modern engine doesn't need that.
 
-The choice is made once at `TaskbarController::new()`; if explorer restarts, the TAP service pointer is stale and there's no reconnection logic. `apply_to_all` re-enumerates taskbar HWNDs on every call (including every animation frame). `Drop` for both `TaskbarAppearanceService` and `TaskbarController` restores defaults, and the controller calls `CoUninitialize` — keep the controller on the main (STA) thread.
+**Explorer restarts.** `TaskbarCreated` (registered message, needs a real top-level window, not `HWND_MESSAGE`) sets `SHELL_RESTARTED` → tray icon re-added, slots dropped, `poll_reconnect` retries ExplorerTAP for ~15 s. A COM call returning an RPC "server died" HRESULT sets `is_disconnected()` and triggers the same retry. Restoring is explicit (`restore_all` on exit); `Drop` impls only release. The COM proxy must be dropped before `CoUninitialize` (handled in `TaskbarController::drop`).
 
-**State detection** (`src/monitor.rs`): priority order is Start menu → Search (both `Windows.UI.Core.CoreWindow` found by title, checked for DWM cloaking) → fullscreen "game" (foreground window covering the whole monitor; forces `Normal`) → maximized → visible window → desktop. `ActiveState` is computed but main currently only uses the returned `StateAppearance`.
+**Colors**: `Color` is RGBA in config/JSON; backends and window-message payloads use ABGR (`to_abgr` / `from_abgr`).
 
-**Transitions** (`src/transition.rs`): ease-out cubic lerp of RGBA only; the discrete `TaskbarState` (brush type) flips at 50 % progress.
+**IPC** (`src/ipc.rs`): pipe `\\.\pipe\mutatio`, message mode, remote clients rejected, one JSON request/response per connection. The server forwards an `IpcRequest { command, reply }` to the main thread and waits up to 3 s for the real response. Wire format is serde-tagged: `{"action":"set_state","payload":"blur"}`.
 
-**Colors** (`src/config.rs`): `Color` is RGBA in config/JSON; backends expect ABGR (`0xAABBGGRR`, `to_abgr()`). The flyout packs swatch colors the same way into `lParam`. Opaque state forces alpha 255 and remaps near-black to pure black in the backend, not in config.
+**Flyout UI** (`src/flyout.rs`): custom-painted GDI popup. Click geometry lives in `HIT_ZONES` and must match the drawing coordinates in `render_flyout`; swatch colors live in `SWATCHES` (used for both clicks and painting). Fonts are cached in a thread-local. All flyout state is thread-local because it's only touched on the UI thread. The "Restart Shell" button kills and restarts `explorer.exe`.
 
-**IPC** (`src/ipc.rs`): pipe `\\.\pipe\mutatio`, message mode, one JSON request/response per connection, 1 KB buffers. `IpcCommand` is serde-tagged `{"action": "...", "payload": ...}` (e.g. `{"action":"set_state","payload":"blur"}`). The server replies `success: true` as soon as the command is queued — it does not report daemon state, so `--status` returns no real status. The pipe has no ACL beyond defaults.
-
-**Flyout UI** (`src/flyout.rs`): a custom-painted GDI popup (no XAML/controls). Layout is hardcoded pixel geometry: `hit_test()` zone rectangles must be kept in sync by hand with the drawing code in `WM_PAINT`. Shared state goes through the `FLYOUT_DATA` mutex and `PARENT_NOTIFY_HWND` atomic; actions are posted back to the main window, never handled in the flyout. The "Reload" button (`ZONE_BTN_RELOAD`) maps to `ACTION_RESTART_EXPLORER`, which kills and restarts `explorer.exe`.
-
-**Config**: `%APPDATA%\Mutatio\config.json` (falls back to `./mutatio.json`). Parse failure silently replaces the file with defaults — a typo in the user's config wipes it. All fields are required by serde (no `#[serde(default)]`), so adding a field to `Config` invalidates every existing config file unless you add defaults. `battery_saver_fallback` is persisted but unused.
+**Config** (`%APPDATA%\Mutatio\config.json`): `#[serde(default)]` everywhere, so missing keys fall back to defaults. An unparsable file is copied to `config.json.bak` before defaults are written. Saves are atomic (temp file + rename). `battery_saver_fallback` is persisted but not implemented.
 
 ## Repo notes
 
-- `Cargo.lock` is gitignored even though this is a binary crate.
-- The README is marketing-heavy; trust the code over its claims (e.g. it knocks TranslucentTB for DLL injection into explorer, yet the modern backend injects `ExplorerTAP.dll`).
+- When `mutatio.exe` (GUI subsystem) is given CLI flags it calls `AttachConsole(ATTACH_PARENT_PROCESS)`, but PowerShell does not wait for GUI programs, so the output is unreliable; `mutatio.com` exists for that reason. A daemon spawned by the CLI is started detached with null stdio.
+- The README is marketing-heavy; trust the code. It criticizes TranslucentTB for DLL injection, yet the modern backend injects TranslucentTB's own `ExplorerTAP.dll`, which still contains TranslucentTB internals (e.g. the `TTBTAP_Ready` event name). Renaming those requires rebuilding the DLL from source.
