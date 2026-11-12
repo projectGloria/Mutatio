@@ -3,7 +3,7 @@
 <p align="center">
   <strong>Next-Generation, Ultra-Lightweight Taskbar Appearance Engine for Windows 11 & 10</strong>
   <br />
-  <em>Engineered from the ground up in 100% modern Rust. Sub-15 MB RAM • 0% Idle CPU • Windows 11 24H2 XAML Support</em>
+  <em>Core daemon and UI built in 100% Rust, interfacing with Windows Modern Shell via embedded TAP bridge. Sub-15 MB RAM • 0% Idle CPU • Windows 11 (21H2–24H2) Support</em>
 </p>
 
 <p align="center">
@@ -20,7 +20,7 @@
 
 **Mutatio** (Latin: *change, transformation*) is a blazing-fast, crash-resistant, modern taskbar appearance engine for Windows 11 (including Build 26100 / 24H2) and Windows 10. 
 
-While legacy C++ utilities like TranslucentTB consume ~95 MB of RAM, use invasive DLL injection into `explorer.exe`, and struggle on modern Windows 11 XAML visual trees, **Mutatio** provides a lightweight (<15 MB RAM), completely self-contained solution with smooth 60fps fade animations, zero idle CPU wakeups, an integrated Fluent Dark Flyout UI, and full CLI/IPC automation.
+Mutatio provides a lightweight (<15 MB RAM), self-contained solution with smooth 60fps fade animations, zero idle CPU wakeups, an integrated Fluent Dark Flyout UI, and full CLI/IPC automation, using in-process shell hooks (via ExplorerTAP) on Windows 11 and composition attributes on Windows 10.
 
 ---
 
@@ -28,15 +28,15 @@ While legacy C++ utilities like TranslucentTB consume ~95 MB of RAM, use invasiv
 
 | Feature | TranslucentTB (Upstream) | **Mutatio (This Project)** |
 | :--- | :--- | :--- |
-| **Language & Safety** | C++ / C++/WinRT / vcpkg | **100% Rust** (`windows-rs` 0.62) |
+| **Language & Safety** | C++ / C++/WinRT / vcpkg | **100% Rust** (`windows-rs` 0.62) + embedded TAP bridge |
 | **Memory Footprint** | ~35 MB – 95 MB RAM | **~13 MB RAM** (sub-15 MB) |
-| **Idle CPU Usage** | Periodic polling wakeups | **0.0% CPU** (Power-efficient wait) |
+| **Idle CPU Usage** | Periodic polling wakeups | **0.0% CPU** (at idle via event-driven WinEvent hooks) |
 | **Win11 24H2 Support** | Often crashes or fails on XAML `BackgroundFill` | **Native COM `ITaskbarAppearanceService`** |
 | **Smooth Transitions** | ❌ Snappy/abrupt state switching | ✅ **60fps Ease-Out Cubic Animations** |
-| **Fullscreen Game Mode** | ❌ Keeps running & polling | ✅ **Auto-Sleep in Fullscreen 3D Games** (Anti-cheat safe) |
+| **Fullscreen Game Mode** | ❌ Keeps running & polling | ✅ **Auto-Sleep in Fullscreen 3D Games** (Game Auto-Pause) |
 | **User Interface** | Heavy multi-megabyte XAML Island | ✅ **Native Fluent Dark Flyout UI** (Auto-dismiss, zero latency) |
 | **CLI & IPC Automation** | ❌ None (GUI only) | ✅ **Built-in CLI & Named Pipe IPC Server** |
-| **Packaging** | Installer + multiple loose DLLs | ✅ **Single standalone binary** |
+| **Packaging** | Installer + multiple loose DLLs | ✅ **Self-contained distribution** |
 
 ---
 
@@ -207,6 +207,6 @@ Output: `dist\Mutatio-Setup-<version>.exe`. The version is read from `Cargo.toml
 
 ## 📄 License & Credits
 
-- Licensed under the [MIT License](LICENSE).
+- Core Mutatio daemon and CLI licensed under the [MIT License](LICENSE).
+- ExplorerTAP bridge derived from [TranslucentTB](https://github.com/TranslucentTB/TranslucentTB) under the [GPL-3.0 License](THIRD_PARTY_LICENSES.md). See [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for full attributions and license details.
 - Powered by the [`windows-rs`](https://github.com/microsoft/windows-rs) crate by Microsoft.
-- Explorer TAP bridge derived from reverse-engineered COM interfaces of the Windows Modern Shell.

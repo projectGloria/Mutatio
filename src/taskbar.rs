@@ -4,14 +4,14 @@ use std::ffi::c_void;
 use std::fs;
 use std::path::PathBuf;
 use windows::core::{w, BOOL, GUID, HRESULT};
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{FreeLibrary, HMODULE, HWND};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_SYSTEMBACKDROP_TYPE,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::StationsAndDesktops::{
-    OpenDesktopW, SetThreadDesktop, DESKTOP_CONTROL_FLAGS,
+    CloseDesktop, OpenDesktopW, SetThreadDesktop, DESKTOP_CONTROL_FLAGS,
 };
 use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, FindWindowW};
 
@@ -150,6 +150,7 @@ type PfnInjectExplorerTAP = unsafe extern "C" fn(HWND, *const GUID, *mut *mut c_
 pub struct TaskbarController {
     pfn_swca: Option<PfnSetWindowCompositionAttribute>,
     tap_service: Option<TaskbarAppearanceService>,
+    h_tap_module: Option<HMODULE>,
     /// Set from `apply` (which only has `&self`) when a COM call reports explorer died.
     tap_dead: Cell<bool>,
     com_initialized: bool,
@@ -158,11 +159,10 @@ pub struct TaskbarController {
 impl TaskbarController {
     pub fn new() -> Self {
         unsafe {
-            // Attach this thread to the interactive desktop once. The old code also did this inside
-            // find_taskbars() whenever explorer was down — leaking a desktop handle on every
-            // animation frame until explorer came back.
+            // Attach this thread to the interactive desktop once.
             if let Ok(hdesk) = OpenDesktopW(w!("Default"), DESKTOP_CONTROL_FLAGS(0), false, 0x1000_0000) {
                 let _ = SetThreadDesktop(hdesk);
+                let _ = CloseDesktop(hdesk);
             }
         }
 
@@ -181,6 +181,7 @@ impl TaskbarController {
         let mut controller = Self {
             pfn_swca,
             tap_service: None,
+            h_tap_module: None,
             tap_dead: Cell::new(false),
             com_initialized,
         };
@@ -208,20 +209,31 @@ impl TaskbarController {
 
     /// (Re)creates the ExplorerTAP connection. Call after explorer restarts (TaskbarCreated).
     pub fn reconnect(&mut self) -> bool {
-        // Drop the stale proxy first; Release on a dead proxy is harmless.
+        // Drop the stale proxy and free the previously loaded module
         self.tap_service = None;
+        if let Some(hmod) = self.h_tap_module.take() {
+            unsafe {
+                let _ = FreeLibrary(hmod);
+            }
+        }
         self.tap_dead.set(false);
-        self.tap_service = Self::init_tap_service();
+        let (service, hmod) = Self::init_tap_service();
+        self.tap_service = service;
+        self.h_tap_module = hmod;
         self.tap_service.is_some()
     }
 
-    fn init_tap_service() -> Option<TaskbarAppearanceService> {
-        let primary_hwnd = unsafe { FindWindowW(w!("Shell_TrayWnd"), None).ok()? };
+    fn init_tap_service() -> (Option<TaskbarAppearanceService>, Option<HMODULE>) {
+        let Some(primary_hwnd) = (unsafe { FindWindowW(w!("Shell_TrayWnd"), None).ok() }) else {
+            return (None, None);
+        };
         if primary_hwnd.is_invalid() {
-            return None;
+            return (None, None);
         }
 
-        let tap_dll_path = Self::ensure_tap_dll()?;
+        let Some(tap_dll_path) = Self::ensure_tap_dll() else {
+            return (None, None);
+        };
 
         unsafe {
             let path_w: Vec<u16> = tap_dll_path
@@ -231,18 +243,23 @@ impl TaskbarController {
                 .chain(std::iter::once(0))
                 .collect();
 
-            // LoadLibrary is ref-counted, so calling this again on reconnect is cheap.
-            let h_module = LoadLibraryW(windows::core::PCWSTR(path_w.as_ptr())).ok()?;
-            let proc_inject = GetProcAddress(h_module, windows::core::s!("InjectExplorerTAP"))?;
+            let Ok(h_module) = LoadLibraryW(windows::core::PCWSTR(path_w.as_ptr())) else {
+                return (None, None);
+            };
+            let Some(proc_inject) = GetProcAddress(h_module, windows::core::s!("InjectExplorerTAP")) else {
+                let _ = FreeLibrary(h_module);
+                return (None, None);
+            };
             let pfn_inject: PfnInjectExplorerTAP = std::mem::transmute(proc_inject);
 
             let mut p_service: *mut c_void = std::ptr::null_mut();
             let hr = pfn_inject(primary_hwnd, &IID_ITASKBAR_APPEARANCE_SERVICE, &mut p_service);
 
             if hr.is_ok() && !p_service.is_null() {
-                TaskbarAppearanceService::from_raw(p_service)
+                (TaskbarAppearanceService::from_raw(p_service), Some(h_module))
             } else {
-                None
+                let _ = FreeLibrary(h_module);
+                (None, None)
             }
         }
     }
@@ -254,7 +271,9 @@ impl TaskbarController {
 
         let tap_dir = base_dir.join("Mutatio");
         let _ = fs::create_dir_all(&tap_dir);
-        let tap_path = tap_dir.join("ExplorerTAP.dll");
+        // Include a short content hash so new versions never collide with a locked DLL loaded in explorer.
+        let hash = format!("{:08x}", EMBEDDED_EXPLORER_TAP.len() ^ (EMBEDDED_EXPLORER_TAP.first().copied().unwrap_or(0) as usize));
+        let tap_path = tap_dir.join(format!("ExplorerTAP_{hash}.dll"));
 
         // Compare full contents, not just length: a same-size rebuild of the DLL would otherwise
         // never be updated. 550 KB read once at startup is negligible.
@@ -401,6 +420,11 @@ impl Drop for TaskbarController {
         // Order matters: the COM proxy must be released BEFORE CoUninitialize. Field drop glue
         // runs after this body, so the old code released it on an already-uninitialized apartment.
         self.tap_service = None;
+        if let Some(hmod) = self.h_tap_module.take() {
+            unsafe {
+                let _ = FreeLibrary(hmod);
+            }
+        }
         if self.com_initialized {
             unsafe { CoUninitialize() };
         }

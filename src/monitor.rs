@@ -111,7 +111,15 @@ impl StateDetector {
     /// The title ("Start", "Search") is localized, so the old FindWindow-by-title check silently
     /// never matched on non-English Windows.
     fn shell_flyout_kind(hwnd: HWND) -> Option<ShellFlyout> {
-        if class_name(hwnd).as_deref() != Some("Windows.UI.Core.CoreWindow") || is_cloaked(hwnd) {
+        let mut buf = [0u16; 64];
+        let len = unsafe { GetClassNameW(hwnd, &mut buf) };
+        if len == 0 || is_cloaked(hwnd) {
+            return None;
+        }
+        let cls = &buf[..len as usize];
+        let is_flyout_class = slice_eq_str(cls, "Windows.UI.Core.CoreWindow")
+            || slice_eq_str(cls, "XamlExplorerHostIslandWindow");
+        if !is_flyout_class {
             return None;
         }
         let exe = process_image_name(hwnd)?.to_ascii_lowercase();
@@ -191,21 +199,49 @@ unsafe fn is_maximized(hwnd: HWND) -> bool {
     }
 }
 
-fn covers(r: &RECT, area: &RECT) -> bool {
+pub(crate) fn covers(r: &RECT, area: &RECT) -> bool {
     r.left <= area.left && r.top <= area.top && r.right >= area.right && r.bottom >= area.bottom
 }
 
-fn is_shell_window(hwnd: HWND) -> bool {
+pub(crate) fn slice_eq_str(utf16: &[u16], s: &str) -> bool {
+    if utf16.len() != s.len() {
+        return false;
+    }
+    utf16.iter().copied().eq(s.encode_utf16())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn is_shell_class_name(cls: &str) -> bool {
     matches!(
-        class_name(hwnd).as_deref(),
-        Some("Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "Windows.UI.Core.CoreWindow")
+        cls,
+        "Progman"
+            | "WorkerW"
+            | "Shell_TrayWnd"
+            | "Shell_SecondaryTrayWnd"
+            | "Windows.UI.Core.CoreWindow"
+            | "XamlExplorerHostIslandWindow"
     )
 }
 
-fn class_name(hwnd: HWND) -> Option<String> {
+fn is_shell_window_cls(utf16: &[u16]) -> bool {
+    const CLASSES: &[&str] = &[
+        "Progman",
+        "WorkerW",
+        "Shell_TrayWnd",
+        "Shell_SecondaryTrayWnd",
+        "Windows.UI.Core.CoreWindow",
+        "XamlExplorerHostIslandWindow",
+    ];
+    CLASSES.iter().any(|&c| slice_eq_str(utf16, c))
+}
+
+fn is_shell_window(hwnd: HWND) -> bool {
     let mut buf = [0u16; 64];
     let len = unsafe { GetClassNameW(hwnd, &mut buf) };
-    (len > 0).then(|| String::from_utf16_lossy(&buf[..len as usize]))
+    if len == 0 {
+        return false;
+    }
+    is_shell_window_cls(&buf[..len as usize])
 }
 
 fn window_rect(hwnd: HWND) -> Option<RECT> {
@@ -258,5 +294,42 @@ fn process_image_name(hwnd: HWND) -> Option<String> {
         res.ok()?;
         let path = String::from_utf16_lossy(&buf[..len as usize]);
         path.rsplit('\\').next().map(str::to_owned)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rect_coverage() {
+        let monitor = RECT { left: 0, top: 0, right: 1920, bottom: 1080 };
+        let full_window = RECT { left: 0, top: 0, right: 1920, bottom: 1080 };
+        let offset_window = RECT { left: -7, top: -7, right: 1927, bottom: 1087 };
+        let partial_window = RECT { left: 100, top: 100, right: 1200, bottom: 800 };
+
+        assert!(covers(&full_window, &monitor));
+        assert!(covers(&offset_window, &monitor)); // Extended frame bounds
+        assert!(!covers(&partial_window, &monitor));
+    }
+
+    #[test]
+    fn test_shell_window_classification() {
+        assert!(is_shell_class_name("Progman"));
+        assert!(is_shell_class_name("WorkerW"));
+        assert!(is_shell_class_name("Shell_TrayWnd"));
+        assert!(is_shell_class_name("Shell_SecondaryTrayWnd"));
+        assert!(is_shell_class_name("Windows.UI.Core.CoreWindow"));
+        assert!(is_shell_class_name("XamlExplorerHostIslandWindow"));
+        assert!(!is_shell_class_name("CabinetWClass")); // File Explorer is user window
+        assert!(!is_shell_class_name("Notepad"));
+    }
+
+    #[test]
+    fn test_slice_eq_str() {
+        let sample: Vec<u16> = "XamlExplorerHostIslandWindow".encode_utf16().collect();
+        assert!(slice_eq_str(&sample, "XamlExplorerHostIslandWindow"));
+        assert!(!slice_eq_str(&sample, "Progman"));
+        assert!(!slice_eq_str(&sample[..5], "XamlExplorerHostIslandWindow"));
     }
 }

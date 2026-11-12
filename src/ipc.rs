@@ -10,7 +10,7 @@ use windows::Win32::Storage::FileSystem::{
     FILE_GENERIC_WRITE, FILE_SHARE_NONE, OPEN_EXISTING,
 };
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, SetNamedPipeHandleState,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PeekNamedPipe, SetNamedPipeHandleState,
     WaitNamedPipeW, NAMED_PIPE_MODE, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS,
     PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
@@ -196,6 +196,22 @@ impl IpcServer {
 fn read_message(h: HANDLE) -> Option<String> {
     let mut buffer = [0u8; BUF_SIZE];
     let mut bytes_read = 0u32;
+    // Guard against malicious/hung clients holding the connection without writing.
+    let start = std::time::Instant::now();
+    loop {
+        let mut avail = 0u32;
+        let ok = unsafe { PeekNamedPipe(h, None, 0, None, Some(&mut avail), None) };
+        if ok.is_err() {
+            return None;
+        }
+        if avail > 0 {
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(3) {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
     unsafe { ReadFile(h, Some(&mut buffer), Some(&mut bytes_read), None).ok()? };
     if bytes_read == 0 {
         return None;
@@ -206,4 +222,29 @@ fn read_message(h: HANDLE) -> Option<String> {
 fn write_message(h: HANDLE, bytes: &[u8]) -> bool {
     let mut written = 0u32;
     unsafe { WriteFile(h, Some(bytes), Some(&mut written), None).is_ok() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ipc_buffer_safety() {
+        let oversized = vec![b'a'; 8192];
+        let res = serde_json::from_slice::<IpcCommand>(&oversized);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_ipc_command_serialization() {
+        let cmd = IpcCommand::SetState("blur".into());
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("set_state"));
+        assert!(json.contains("blur"));
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        match parsed {
+            IpcCommand::SetState(s) => assert_eq!(s, "blur"),
+            _ => panic!("wrong variant"),
+        }
+    }
 }

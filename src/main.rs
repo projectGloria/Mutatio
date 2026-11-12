@@ -34,8 +34,10 @@ use windows::core::{w, BOOL};
 use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{MonitorFromWindow, HMONITOR, MONITOR_DEFAULTTOPRIMARY};
 use windows::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT};
+use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
+use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetAncestor, GetCursorPos,
     MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
@@ -206,8 +208,19 @@ impl App {
             .collect();
     }
 
+    fn is_battery_saver_active(&self) -> bool {
+        let mut sps = SYSTEM_POWER_STATUS::default();
+        unsafe {
+            if GetSystemPowerStatus(&mut sps).is_ok() {
+                sps.SystemStatusFlag == 1
+            } else {
+                false
+            }
+        }
+    }
+
     /// Recomputes every taskbar's target and starts transitions where it changed.
-    fn update_targets(&mut self) {
+    fn update_targets(&mut self, is_safety_poll: bool) {
         self.refresh_slots(); // cheap (a few FindWindowEx calls) and catches new monitors
         if FORCE_REAPPLY.swap(false, Ordering::Relaxed) {
             self.slots.iter_mut().for_each(|s| s.applied = false);
@@ -220,13 +233,17 @@ impl App {
             StateDetector::detect(&self.config, &monitors)
         };
 
-        // The SWCA fallback gets reset by explorer on its own (start menu, focus changes), so it
-        // has to be re-pushed every pass. The modern XAML engine keeps what we set.
-        let reassert = !self.taskbar.is_modern();
+        // SWCA fallback: reassert only on safety poll (1s) rather than 60 Hz to eliminate syscall churn.
+        let reassert = !self.taskbar.is_modern() && is_safety_poll;
+        let battery_saver = self.config.battery_saver_fallback && self.is_battery_saver_active();
 
         for (slot, state) in self.slots.iter_mut().zip(states) {
             slot.state = state;
-            let target = self.force_preset.unwrap_or_else(|| state.appearance(&self.config));
+            let mut target = self.force_preset.unwrap_or_else(|| state.appearance(&self.config));
+
+            if battery_saver {
+                target = StateAppearance::preset(TaskbarState::Normal);
+            }
 
             if !slot.applied {
                 slot.transition = None;
@@ -234,7 +251,7 @@ impl App {
                 self.taskbar.apply(slot.hwnd, &target);
                 slot.applied = true;
             } else if target != slot.target() {
-                if self.config.smooth_transitions && self.config.transition_duration_ms > 0 {
+                if !battery_saver && self.config.smooth_transitions && self.config.transition_duration_ms > 0 {
                     slot.transition =
                         Some(StateTransition::new(slot.current, target, self.config.transition_duration_ms));
                 } else {
@@ -544,6 +561,10 @@ fn main() {
         return;
     }
 
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+
     // Single instance. Two daemons would fight over the taskbar every frame, and the pipe server
     // happily allowed it (PIPE_UNLIMITED_INSTANCES). Handle intentionally leaked: it must live
     // for the whole process. Initially *owned* on purpose: `--quit` waits on it, and an owned
@@ -600,7 +621,7 @@ fn main() {
         reconnect_attempts_left: 0,
         next_reconnect: Instant::now(),
     };
-    app.update_targets();
+    app.update_targets(true);
     println!("[+] Found {} taskbar instances", app.slots.len());
 
     let mut last_detect = Instant::now();
@@ -625,7 +646,7 @@ fn main() {
                             flyout.hide();
                         }
                         // Re-run detection now so the flyout shows the post-action state.
-                        app.update_targets();
+                        app.update_targets(true);
                         flyout.update_state(app.flyout_state());
                     }
                     _ => {}
@@ -652,10 +673,11 @@ fn main() {
         let now = Instant::now();
         let since_detect = now - last_detect;
         let mut detect_wait = None;
-        if DETECT_DIRTY.load(Ordering::Relaxed) || since_detect >= SAFETY_POLL {
+        let is_safety_poll = since_detect >= SAFETY_POLL;
+        if DETECT_DIRTY.load(Ordering::Relaxed) || is_safety_poll {
             if since_detect >= MIN_DETECT_INTERVAL {
                 DETECT_DIRTY.store(false, Ordering::Relaxed);
-                app.update_targets();
+                app.update_targets(is_safety_poll);
                 last_detect = Instant::now();
             } else {
                 detect_wait = Some(MIN_DETECT_INTERVAL - since_detect);

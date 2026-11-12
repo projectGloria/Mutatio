@@ -14,6 +14,10 @@ fn main() {
     if !cli::handle_cli_client(&args) {
         // Bare `mutatio` (or --daemon) from a terminal: start the tray daemon detached and return
         // the prompt immediately.
-        cli::spawn_daemon(args.get(2).filter(|_| args[1] == "--daemon-start").map(String::as_str));
+        let preset = match (args.get(1).map(String::as_str), args.get(2).map(String::as_str)) {
+            (Some("--daemon-start"), Some(name)) => Some(name),
+            _ => None,
+        };
+        cli::spawn_daemon(preset);
     }
 }

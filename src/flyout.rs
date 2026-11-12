@@ -288,17 +288,17 @@ const ZONE_BTN_EXIT: i32 = 32;
 /// drawn in `render_flyout`.
 const HIT_ZONES: &[(i32, i32, i32, i32, i32)] = &[
     (ZONE_CLOSE, 310, 10, 340, 40),
-    (ZONE_PRESET_CLEAR, 16, 65, 116, 110),
-    (ZONE_PRESET_BLUR, 125, 65, 225, 110),
-    (ZONE_PRESET_ACRYLIC, 234, 65, 334, 110),
-    (ZONE_PRESET_OPAQUE, 16, 118, 170, 158),
-    (ZONE_PRESET_DEFAULT, 180, 118, 334, 158),
-    (ZONE_SWATCH_BLACK, 20, 195, 50, 225),
-    (ZONE_SWATCH_SLATE, 65, 195, 95, 225),
-    (ZONE_SWATCH_NAVY, 110, 195, 140, 225),
-    (ZONE_SWATCH_CRIMSON, 155, 195, 185, 225),
-    (ZONE_SWATCH_EMERALD, 200, 195, 230, 225),
-    (ZONE_SWATCH_WHITE, 245, 195, 275, 225),
+    (ZONE_PRESET_CLEAR, 16, 76, 116, 112),
+    (ZONE_PRESET_BLUR, 125, 76, 225, 112),
+    (ZONE_PRESET_ACRYLIC, 234, 76, 334, 112),
+    (ZONE_PRESET_OPAQUE, 16, 120, 170, 156),
+    (ZONE_PRESET_DEFAULT, 180, 120, 334, 156),
+    (ZONE_SWATCH_BLACK, 21, 182, 49, 210),
+    (ZONE_SWATCH_SLATE, 66, 182, 94, 210),
+    (ZONE_SWATCH_NAVY, 111, 182, 139, 210),
+    (ZONE_SWATCH_CRIMSON, 156, 182, 184, 210),
+    (ZONE_SWATCH_EMERALD, 201, 182, 229, 210),
+    (ZONE_SWATCH_WHITE, 246, 182, 274, 210),
     (ZONE_TOGGLE_DYNAMIC, 16, 258, 334, 292),
     (ZONE_TOGGLE_SMOOTH, 16, 296, 334, 330),
     (ZONE_TOGGLE_GAME, 16, 334, 334, 368),
@@ -801,6 +801,9 @@ mod tests {
     #[test]
     fn hit_test_samples() {
         assert_eq!(hit_test(66, 90), ZONE_PRESET_CLEAR);
+        assert_eq!(hit_test(16, 76), ZONE_PRESET_CLEAR);
+        assert_eq!(hit_test(116, 112), ZONE_PRESET_CLEAR);
+        assert_eq!(hit_test(21, 182), ZONE_SWATCH_BLACK);
         assert_eq!(hit_test(35, 210), ZONE_SWATCH_BLACK);
         assert_eq!(hit_test(170, 480), ZONE_BTN_RESTART_SHELL);
         assert_eq!(hit_test(5, 5), -1);
