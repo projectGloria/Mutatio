@@ -157,7 +157,7 @@ pub struct Config {
     /// Restore the stock taskbar while a fullscreen app/game owns the monitor
     pub game_mode_pause: bool,
 
-    /// Reserved; not implemented yet.
+    /// Restore the stock taskbar while Windows Battery Saver is active
     pub battery_saver_fallback: bool,
 }
 

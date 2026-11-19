@@ -5,6 +5,11 @@ use std::time::Duration;
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, HANDLE, HWND, LPARAM, WPARAM,
 };
+use windows::Win32::Security::{
+    AddAccessAllowedAce, GetLengthSid, GetTokenInformation, InitializeAcl,
+    InitializeSecurityDescriptor, SetSecurityDescriptorDacl, TokenUser, ACL,
+    PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER,
+};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ,
     FILE_GENERIC_WRITE, FILE_SHARE_NONE, OPEN_EXISTING,
@@ -14,6 +19,7 @@ use windows::Win32::System::Pipes::{
     WaitNamedPipeW, NAMED_PIPE_MODE, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS,
     PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
 pub const PIPE_NAME: &str = r"\\.\pipe\mutatio";
@@ -76,8 +82,10 @@ impl IpcServer {
     pub fn start(cmd_sender: Sender<IpcRequest>, wake_hwnd: isize) {
         thread::spawn(move || {
             let pipe_name_w: Vec<u16> = PIPE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+            let user_dacl = CurrentUserPipeDacl::new();
 
             loop {
+                let sa_ptr = user_dacl.as_ref().map(|d| &d.sa as *const SECURITY_ATTRIBUTES);
                 let h_pipe = unsafe {
                     CreateNamedPipeW(
                         windows::core::PCWSTR(pipe_name_w.as_ptr()),
@@ -88,7 +96,7 @@ impl IpcServer {
                         BUF_SIZE as u32,
                         BUF_SIZE as u32,
                         0,
-                        None,
+                        sa_ptr,
                     )
                 };
 
@@ -222,6 +230,66 @@ fn read_message(h: HANDLE) -> Option<String> {
 fn write_message(h: HANDLE, bytes: &[u8]) -> bool {
     let mut written = 0u32;
     unsafe { WriteFile(h, Some(bytes), Some(&mut written), None).is_ok() }
+}
+
+/// Owns a `SECURITY_ATTRIBUTES` + DACL restricting pipe access to the current user's SID.
+struct CurrentUserPipeDacl {
+    _sd: Box<SECURITY_DESCRIPTOR>,
+    _acl_buf: Vec<u8>,
+    sa: SECURITY_ATTRIBUTES,
+}
+
+impl CurrentUserPipeDacl {
+    fn new() -> Option<Self> {
+        unsafe {
+            let mut token = HANDLE::default();
+            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).ok()?;
+
+            let mut needed = 0u32;
+            let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
+            if needed == 0 {
+                let _ = CloseHandle(token);
+                return None;
+            }
+
+            let mut token_buf = vec![0u8; needed as usize];
+            let ok = GetTokenInformation(
+                token,
+                TokenUser,
+                Some(token_buf.as_mut_ptr() as *mut _),
+                needed,
+                &mut needed,
+            );
+            let _ = CloseHandle(token);
+            ok.ok()?;
+
+            let user_sid = (*(token_buf.as_ptr() as *const TOKEN_USER)).User.Sid;
+            let sid_len = GetLengthSid(user_sid) as usize;
+            // ACL header + ACCESS_ALLOWED_ACE header (8 bytes) + SID
+            let acl_size = (std::mem::size_of::<ACL>() + 8 + sid_len + 3) & !3;
+            let mut acl_buf = vec![0u8; acl_size];
+            let acl_ptr = acl_buf.as_mut_ptr() as *mut ACL;
+            const ACL_REVISION_VAL: windows::Win32::Security::ACE_REVISION =
+                windows::Win32::Security::ACE_REVISION(2);
+            const SD_REVISION_VAL: u32 = 1;
+            const GENERIC_ALL_VAL: u32 = 0x1000_0000;
+
+            InitializeAcl(acl_ptr, acl_size as u32, ACL_REVISION_VAL).ok()?;
+            AddAccessAllowedAce(acl_ptr, ACL_REVISION_VAL, GENERIC_ALL_VAL, user_sid).ok()?;
+
+            let mut sd = Box::new(SECURITY_DESCRIPTOR::default());
+            let psd = PSECURITY_DESCRIPTOR(sd.as_mut() as *mut SECURITY_DESCRIPTOR as *mut _);
+            InitializeSecurityDescriptor(psd, SD_REVISION_VAL).ok()?;
+            SetSecurityDescriptorDacl(psd, true, Some(acl_ptr), false).ok()?;
+
+            let sa = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: psd.0,
+                bInheritHandle: false.into(),
+            };
+            Some(Self { _sd: sd, _acl_buf: acl_buf, sa })
+        }
+    }
 }
 
 #[cfg(test)]

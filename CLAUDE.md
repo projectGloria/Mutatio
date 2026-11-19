@@ -52,7 +52,7 @@ Don't reintroduce unconditional sleeps/polling in the loop.
 
 **Flyout UI** (`src/flyout.rs`): custom-painted GDI popup. Click geometry lives in `HIT_ZONES` and must match the drawing coordinates in `render_flyout`; swatch colors live in `SWATCHES` (used for both clicks and painting). Fonts are cached in a thread-local. All flyout state is thread-local because it's only touched on the UI thread. The "Restart Shell" button kills and restarts `explorer.exe`.
 
-**Config** (`%APPDATA%\Mutatio\config.json`): `#[serde(default)]` everywhere, so missing keys fall back to defaults. An unparsable file is copied to `config.json.bak` before defaults are written. Saves are atomic (temp file + rename). `battery_saver_fallback` is persisted but not implemented.
+**Config** (`%APPDATA%\Mutatio\config.json`): `#[serde(default)]` everywhere, so missing keys fall back to defaults. An unparsable file is copied to `config.json.bak` before defaults are written. Saves are atomic (temp file + rename). `battery_saver_fallback` restores the stock taskbar while Battery Saver is active.
 
 ## Repo notes
 

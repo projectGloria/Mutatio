@@ -59,12 +59,15 @@ pub fn spawn_daemon(preset: Option<&str>) {
     }
     // Null stdio: an inherited pipe handle would keep a `mutatio | ...` pipeline open for as long
     // as the daemon lives.
-    let _ = cmd
+    if let Err(e) = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-        .spawn();
+        .spawn()
+    {
+        eprintln!("Error: Failed to start Mutatio daemon: {e}");
+    }
 }
 
 fn print_response(res: Result<IpcResponse, String>) -> bool {
@@ -95,27 +98,29 @@ fn wait_for_daemon_exit() {
     }
 }
 
-/// Handles a CLI invocation. Returns false when there is nothing to do as a client (no args or a
-/// `--daemon*` flag), i.e. the caller should run/start the daemon instead.
-pub fn handle_cli_client(args: &[String]) -> bool {
-    let Some(flag) = args.get(1) else { return false };
+/// Handles a CLI invocation. Returns `None` when there is nothing to do as a client (no args or a
+/// `--daemon*` flag), i.e. the caller should run/start the daemon instead; otherwise returns the
+/// process exit code (`0` on success, `1` on error).
+pub fn handle_cli_client(args: &[String]) -> Option<i32> {
+    let flag = args.get(1)?;
     if flag == "--daemon" || flag == "--daemon-start" {
-        return false;
+        return None;
     }
 
     attach_parent_console();
 
     if let Some(state) = flag.strip_prefix("--").and_then(TaskbarState::parse) {
-        match IpcServer::send_client_command(&IpcCommand::SetState(state.name().into())) {
+        let code = match IpcServer::send_client_command(&IpcCommand::SetState(state.name().into())) {
             Ok(r) => {
-                print_response(Ok(r));
+                if print_response(Ok(r)) { 0 } else { 1 }
             }
             Err(_) => {
                 println!("[*] Starting Mutatio background daemon with {} taskbar...", state.name());
                 spawn_daemon(Some(state.name()));
+                0
             }
-        }
-        return true;
+        };
+        return Some(code);
     }
 
     let command = match flag.as_str() {
@@ -127,22 +132,27 @@ pub fn handle_cli_client(args: &[String]) -> bool {
             Some((_, Some(c))) => IpcCommand::SetColor { r: c.r, g: c.g, b: c.b, a: c.a },
             Some((h, None)) => {
                 eprintln!("Invalid color hex: {h} (expected #RRGGBB or #RRGGBBAA)");
-                return true;
+                return Some(1);
             }
             None => {
                 eprintln!("Missing color hex argument");
-                return true;
+                return Some(1);
             }
         },
+        "--help" | "-h" | "/?" => {
+            print_help();
+            return Some(0);
+        }
         _ => {
             print_help();
-            return true;
+            return Some(1);
         }
     };
 
     let is_quit = matches!(command, IpcCommand::Quit);
-    if print_response(IpcServer::send_client_command(&command)) && is_quit {
+    let ok = print_response(IpcServer::send_client_command(&command));
+    if ok && is_quit {
         wait_for_daemon_exit();
     }
-    true
+    Some(if ok { 0 } else { 1 })
 }

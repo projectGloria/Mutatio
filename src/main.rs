@@ -21,11 +21,14 @@ use flyout::{
 use ipc::{IpcCommand, IpcRequest, IpcResponse, IpcServer};
 use cli::{handle_cli_client, DAEMON_MUTEX};
 use monitor::{ActiveState, StateDetector};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use taskbar::TaskbarController;
 use transition::StateTransition;
@@ -38,13 +41,14 @@ use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetAncestor, GetCursorPos,
     MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
     RegisterWindowMessageW, TranslateMessage, CHILDID_SELF, EVENT_OBJECT_CLOAKED,
     EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED,
     EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, GA_ROOT, MSG,
-    MWMO_INPUTAVAILABLE, OBJID_WINDOW, PM_REMOVE, QS_ALLINPUT, WINDOW_EX_STYLE,
+    MWMO_INPUTAVAILABLE, OBJID_WINDOW, PM_REMOVE, QS_ALLINPUT, SW_SHOWNORMAL, WINDOW_EX_STYLE,
     WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP, WM_COMMAND, WM_DESTROY,
     WM_DISPLAYCHANGE, WM_LBUTTONUP, WM_QUIT, WM_SETTINGCHANGE, WNDCLASSW, WS_OVERLAPPED,
 };
@@ -60,6 +64,30 @@ static SHELL_RESTARTED: AtomicBool = AtomicBool::new(false);
 static FORCE_REAPPLY: AtomicBool = AtomicBool::new(false);
 static WM_TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+fn init_log() {
+    let base = std::env::var("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let dir = base.join("Mutatio");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("mutatio.log");
+    // Cap log size on startup so it never grows unbounded across restarts.
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 256 * 1024) {
+        let _ = std::fs::write(&path, b"");
+    }
+    let _ = LOG_PATH.set(path);
+}
+
+fn log_msg(msg: &str) {
+    println!("{msg}");
+    if let Some(path) = LOG_PATH.get()
+        && let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path)
+    {
+        let _ = writeln!(f, "{msg}");
+    }
+}
 
 const ID_TOGGLE_FLYOUT: usize = 2002;
 /// Posted by the console ctrl handler purely to wake the idle wait.
@@ -284,10 +312,11 @@ impl App {
     }
 
     fn on_shell_restarted(&mut self) {
-        println!("[*] Explorer restarted; reconnecting");
+        log_msg("[*] Explorer restarted; reconnecting...");
         self.slots.clear(); // old HWNDs are dead
         self.reconnect_attempts_left = if self.wants_modern { RECONNECT_ATTEMPTS } else { 0 };
-        self.next_reconnect = Instant::now();
+        // Give the new explorer.exe time to finish creating its XAML host before injecting.
+        self.next_reconnect = Instant::now() + Duration::from_secs(2);
         DETECT_DIRTY.store(true, Ordering::Relaxed);
     }
 
@@ -295,8 +324,9 @@ impl App {
     /// window appears. Returns how long until the next attempt, if any remain.
     fn poll_reconnect(&mut self) -> Option<Duration> {
         if self.taskbar.is_disconnected() && self.reconnect_attempts_left == 0 {
-            // A COM call failed without a TaskbarCreated (explorer crashed and is still down).
+            // A COM call failed without a TaskbarCreated (explorer crashed or is restarting).
             self.reconnect_attempts_left = RECONNECT_ATTEMPTS;
+            self.next_reconnect = Instant::now() + Duration::from_secs(2);
         }
         if self.reconnect_attempts_left == 0 {
             return None;
@@ -307,14 +337,15 @@ impl App {
         }
 
         self.reconnect_attempts_left -= 1;
+        log_msg("[*] Attempting ExplorerTAP reconnect...");
         if self.taskbar.reconnect() {
-            println!("[+] Modern taskbar engine reconnected");
+            log_msg("[+] Modern taskbar engine reconnected");
             self.reconnect_attempts_left = 0;
             self.slots.iter_mut().for_each(|s| s.applied = false);
             DETECT_DIRTY.store(true, Ordering::Relaxed);
             None
         } else if self.reconnect_attempts_left == 0 {
-            println!("[!] Could not reconnect modern engine; using fallback");
+            log_msg("[!] Could not reconnect modern engine; using fallback");
             None
         } else {
             self.next_reconnect = now + RECONNECT_INTERVAL;
@@ -326,11 +357,24 @@ impl App {
         self.force_preset = Some(StateAppearance::preset(state));
     }
 
+    fn active_config_appearance_mut(&mut self) -> &mut StateAppearance {
+        if !self.config.dynamic_modes_enabled {
+            return &mut self.config.desktop;
+        }
+        match self.slots.first().map(|s| s.state) {
+            Some(ActiveState::VisibleWindow) => &mut self.config.visible_window,
+            Some(ActiveState::MaximizedWindow) => &mut self.config.maximized_window,
+            Some(ActiveState::StartOpened) => &mut self.config.start_opened,
+            Some(ActiveState::SearchOpened) => &mut self.config.search_opened,
+            _ => &mut self.config.desktop,
+        }
+    }
+
     fn set_color(&mut self, color: Color) {
         match self.force_preset.as_mut() {
             Some(forced) => forced.color = color,
             None => {
-                self.config.desktop.color = color;
+                self.active_config_appearance_mut().color = color;
                 self.save_config();
             }
         }
@@ -445,7 +489,8 @@ impl App {
             ACTION_TOGGLE_BORDER => match self.force_preset.as_mut() {
                 Some(forced) => forced.show_line = !forced.show_line,
                 None => {
-                    self.config.desktop.show_line = !self.config.desktop.show_line;
+                    let entry = self.active_config_appearance_mut();
+                    entry.show_line = !entry.show_line;
                     self.save_config();
                 }
             },
@@ -456,15 +501,31 @@ impl App {
                 let _ = Command::new("notepad.exe").arg(&self.config_path).spawn();
             }
             ACTION_RESTART_EXPLORER => {
-                // Off the UI thread: taskkill takes a few hundred ms. CREATE_NO_WINDOW stops the
-                // old `cmd /c` approach from flashing a console window.
+                // Off the UI thread: taskkill takes a few hundred ms. Use ShellExecuteW to launch
+                // explorer.exe cleanly detached from Mutatio's stdio/process group.
                 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
                 std::thread::spawn(|| {
                     let _ = Command::new("taskkill")
                         .args(["/f", "/im", "explorer.exe"])
                         .creation_flags(CREATE_NO_WINDOW)
                         .status();
-                    let _ = Command::new("explorer.exe").spawn();
+                    let explorer_path = std::env::var("WINDIR")
+                        .map(|w| format!("{w}\\explorer.exe"))
+                        .unwrap_or_else(|_| "explorer.exe".to_string());
+                    let path_w: Vec<u16> = explorer_path.encode_utf16().chain(std::iter::once(0)).collect();
+                    unsafe {
+                        let res = ShellExecuteW(
+                            None,
+                            w!("open"),
+                            windows::core::PCWSTR(path_w.as_ptr()),
+                            None,
+                            None,
+                            SW_SHOWNORMAL,
+                        );
+                        if (res.0 as usize) <= 32 {
+                            log_msg(&format!("[!] ShellExecuteW(explorer.exe) failed: {:?}", res.0));
+                        }
+                    }
                 });
                 // TaskbarCreated will trigger the reconnect once the new shell is up.
             }
@@ -557,8 +618,8 @@ fn drain_ipc(app: &mut App, rx: &Receiver<IpcRequest>) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if handle_cli_client(&args) {
-        return;
+    if let Some(code) = handle_cli_client(&args) {
+        std::process::exit(code);
     }
 
     unsafe {
@@ -577,7 +638,8 @@ fn main() {
         }
     }
 
-    println!("[*] Starting Mutatio Daemon...");
+    init_log();
+    log_msg(&format!("[*] Starting Mutatio Daemon v{}...", env!("CARGO_PKG_VERSION")));
 
     let initial_forced_preset = match (args.get(1).map(String::as_str), args.get(2)) {
         (Some("--daemon-start"), Some(name)) => TaskbarState::parse(name).map(StateAppearance::preset),
@@ -586,9 +648,10 @@ fn main() {
 
     let config_path = Config::default_path();
     let config = Config::load_or_create(&config_path);
-    println!("[+] Configuration loaded from: {:?}", config_path);
+    log_msg(&format!("[+] Configuration loaded from: {:?}", config_path));
 
     let taskbar = TaskbarController::new();
+    log_msg(&format!("[+] Active taskbar engine: {}", taskbar.engine_name()));
 
     let hwnd = create_message_window();
     MAIN_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
@@ -642,7 +705,7 @@ fn main() {
                     }
                     WM_FLYOUT_ACTION => {
                         app.handle_flyout_action(msg.wParam.0, msg.lParam);
-                        if msg.wParam.0 == ACTION_EXIT {
+                        if matches!(msg.wParam.0, ACTION_EXIT | ACTION_RESTART_EXPLORER) {
                             flyout.hide();
                         }
                         // Re-run detection now so the flyout shows the post-action state.

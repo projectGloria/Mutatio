@@ -271,9 +271,14 @@ impl TaskbarController {
 
         let tap_dir = base_dir.join("Mutatio");
         let _ = fs::create_dir_all(&tap_dir);
-        // Include a short content hash so new versions never collide with a locked DLL loaded in explorer.
-        let hash = format!("{:08x}", EMBEDDED_EXPLORER_TAP.len() ^ (EMBEDDED_EXPLORER_TAP.first().copied().unwrap_or(0) as usize));
-        let tap_path = tap_dir.join(format!("ExplorerTAP_{hash}.dll"));
+        // 64-bit FNV-1a content hash so same-size DLL rebuilds never collide with a locked file.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in EMBEDDED_EXPLORER_TAP {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        let file_name = format!("ExplorerTAP_{h:016x}.dll");
+        let tap_path = tap_dir.join(&file_name);
 
         // Compare full contents, not just length: a same-size rebuild of the DLL would otherwise
         // never be updated. 550 KB read once at startup is negligible.
@@ -283,6 +288,17 @@ impl TaskbarController {
         // explorer still has it loaded from a previous run — that's fine when it's identical.)
         if !up_to_date && fs::write(&tap_path, EMBEDDED_EXPLORER_TAP).is_err() {
             return None;
+        }
+
+        // Best-effort cleanup of older DLL versions (locked ones are silently skipped).
+        if let Ok(entries) = fs::read_dir(&tap_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let s = name.to_string_lossy();
+                if s.starts_with("ExplorerTAP") && s.ends_with(".dll") && s != file_name {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
         }
 
         Some(tap_path)
