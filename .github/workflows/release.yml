@@ -1,0 +1,118 @@
+name: Windows installer
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and verify the installer without publishing
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      build: ${{ steps.check.outputs.build }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - id: check
+        shell: bash
+        env:
+          BEFORE: ${{ github.event.before }}
+          MANUAL: ${{ github.event_name == 'workflow_dispatch' }}
+          DRY: ${{ inputs.dry_run }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re, subprocess, tomllib
+          env = os.environ
+          manual = env["MANUAL"] == "true"
+          if manual and env["DRY"] != "true" and env["GITHUB_REF"] != "refs/heads/main":
+              raise SystemExit("Publish from main")
+          cargo_ver = tomllib.loads(pathlib.Path("Cargo.toml").read_text())["package"]["version"]
+          gloria_ver = tomllib.loads(pathlib.Path("gloria.toml").read_text())["version"]
+          if cargo_ver != gloria_ver:
+              raise SystemExit(f"Version mismatch: Cargo.toml={cargo_ver} vs gloria.toml={gloria_ver}")
+          if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", cargo_ver):
+              raise SystemExit("Unsupported installer version")
+          previous = None
+          before = env["BEFORE"]
+          if not manual and before and before != "0" * 40:
+              def git(*args):
+                  return subprocess.check_output(["git", *args], text=True).strip()
+              if git("ls-tree", "--name-only", before, "--", "Cargo.toml"):
+                  previous = tomllib.loads(git("show", before + ":Cargo.toml"))["package"]["version"]
+          with open(env["GITHUB_OUTPUT"], "a") as output:
+              print(f"version={cargo_ver}", file=output)
+              print(f"build={str(manual or previous != cargo_ver).lower()}", file=output)
+          PY
+
+  build:
+    needs: version
+    if: needs.version.outputs.build == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+      - name: Test release build
+        shell: pwsh
+        run: cargo test --release --locked
+      - name: Stage Windows x64 payload
+        id: stage
+        shell: pwsh
+        run: ./scripts/package.ps1 -StageOnly
+      - name: Build GloriaSetup installer
+        shell: pwsh
+        run: npx --yes gloria-setup@0.2.1 --app "${{ steps.stage.outputs.app-dir }}" --manifest gloria.toml --version "${{ needs.version.outputs.version }}" --out dist
+      - name: Verify installer
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          $setup = "dist\Mutatio_$($env:VERSION)_x64-setup.exe"
+          if (-not (Test-Path -LiteralPath $setup)) {
+            throw "Expected installer not found: $setup"
+          }
+          $file = Get-Item -LiteralPath $setup
+          if (-not $file.Length) {
+            throw "Installer is empty: $setup"
+          }
+          $result = Start-Process -FilePath $file.FullName -ArgumentList '/S --dry-run' -Wait -PassThru
+          if ($result.ExitCode -ne 0) { throw "Installer dry run failed ($($result.ExitCode))" }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-installer
+          path: dist/Mutatio_${{ needs.version.outputs.version }}_x64-setup.exe
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    needs: [version, build]
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || !inputs.dry_run)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release-v${{ needs.version.outputs.version }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: windows-installer
+          path: dist
+      - name: Publish verified draft assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: bash scripts/publish.sh
