@@ -23,3 +23,4 @@ err.txt
 # Installer output and generated wizard art
 /dist
 /installer/build
+[Dd]esktop.ini
