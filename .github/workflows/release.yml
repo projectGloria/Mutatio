@@ -72,7 +72,7 @@ jobs:
         run: ./scripts/package.ps1 -StageOnly
       - name: Build GloriaSetup installer
         shell: pwsh
-        run: npx --yes gloria-setup@0.2.1 --app "${{ steps.stage.outputs.app-dir }}" --manifest gloria.toml --version "${{ needs.version.outputs.version }}" --out dist
+        run: npx --yes gloria-setup@0.2.2 --app "${{ steps.stage.outputs.app-dir }}" --manifest gloria.toml --version "${{ needs.version.outputs.version }}" --out dist
       - name: Verify installer
         shell: pwsh
         env:
