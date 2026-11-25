@@ -7,7 +7,7 @@ Windows-only (x86_64, Win10/11) taskbar appearance daemon and CLI built in Rust 
 - Test (all): `cargo test`
 - Test (single): `cargo test hex_parsing`
 - Lint / Typecheck: `cargo clippy --all-targets -- -D warnings`
-- Build / Package: `cargo build --release` (GUI subsystem -> `target/release/mutatio.exe` + `mutatio-cli.exe`); installer: `powershell -ExecutionPolicy Bypass -File installer\build.ps1` (requires Windows SDK `rc.exe` and Inno Setup 6 -> `dist\`)
+- Build / Package: `cargo build --release` (GUI subsystem -> `target/release/mutatio.exe` + `mutatio-cli.exe`); installer: `powershell -ExecutionPolicy Bypass -File scripts\package.ps1` (GloriaSetup -> `dist\Mutatio_<version>_x64-setup.exe`)
 
 ## Architecture
 - `src/main.rs` — STA event-driven tray daemon (`mutatio.exe`): drains messages/IPC, coalesces WinEvent hooks (`DETECT_DIRTY`, ~60 Hz cap), steps 16 ms transition frames only while animating (1 s safety poll otherwise), and blocks in `MsgWaitForMultipleObjectsEx`.
@@ -17,7 +17,7 @@ Windows-only (x86_64, Win10/11) taskbar appearance daemon and CLI built in Rust 
 - `src/ipc.rs` — Named pipe `\\.\pipe\mutatio` (message mode, rejects remote clients, serde-tagged JSON) forwarding `IpcRequest` to the main thread with a 3 s timeout.
 - `src/flyout.rs` & `src/tray.rs` — Custom-painted GDI popup (`HIT_ZONES` must match `render_flyout`; `SWATCHES` shared by clicks and painting; thread-local state/font cache). "Restart Shell" kills and restarts `explorer.exe`.
 - `src/config.rs` — Atomic JSON saves to `%APPDATA%\Mutatio\config.json` (`#[serde(default)]` everywhere; unparsable files backed up to `config.json.bak`); `battery_saver_fallback` restores stock taskbar on Battery Saver.
-- **Version Manifests:** `Cargo.toml` (single source of truth; `build.rs` injects `CARGO_PKG_VERSION` into `mutatio.rc`, and `installer/mutatio.iss` reads `ProductVersion` from the built exe).
+- **Version Manifests:** `Cargo.toml`, `gloria.toml` (keep synced in lockstep; `build.rs` injects `CARGO_PKG_VERSION` into `mutatio.rc`).
 
 ## Personal Rules (Brain)
 - **Git Branching:** Never create new branches or git worktrees. Always work directly on `main` until explicitly told otherwise.
@@ -40,6 +40,6 @@ Windows-only (x86_64, Win10/11) taskbar appearance daemon and CLI built in Rust 
 - **Code Over README:** Trust source code over `README.md` (modern backend injects prebuilt TranslucentTB `assets/ExplorerTAP.dll`, including `TTBTAP_Ready` internals).
 
 ## Done Criteria
-Run `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `cargo build --release` before reporting complete. For shell/taskbar changes, manually verify against a running daemon and restore `%APPDATA%\Mutatio\config.json`. Verify `Cargo.toml` version reflects any required bump.
+Run `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `cargo build --release` before reporting complete. For shell/taskbar changes, manually verify against a running daemon and restore `%APPDATA%\Mutatio\config.json`. Verify `Cargo.toml` and `gloria.toml` versions stay synced.
 
 <!-- brain-sync: 4401790b0df9 -->
