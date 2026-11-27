@@ -19,8 +19,8 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "CompanyName",      "projectGloria"
-            VALUE "FileDescription",  "Mutatio - Taskbar Appearance Engine"
+            VALUE "CompanyName",      "Project Gloria"
+            VALUE "FileDescription",  "Mutatio"
             VALUE "FileVersion",      "@VER_STR@"
             VALUE "InternalName",     "mutatio"
             VALUE "LegalCopyright",   "Copyright (c) Nihil. MIT License."
